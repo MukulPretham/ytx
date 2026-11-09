@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { classifyFailure, shouldRetry } from "../src/ytdlp/classify.ts";
 import { nextAttemptAt, QueueEntrySchema, scheduleEntry, type QueueEntry } from "../src/core/queue.ts";
 import { CATALOG, findCatalogEntry, modelDirName, parseRepoInput } from "../src/models/catalog.ts";
-import { ManifestSchema } from "../src/models/manager.ts";
+import { ManifestSchema, configuredModel, effectiveDefault } from "../src/models/manager.ts";
 import { suggestMlxRepo } from "../src/models/hub.ts";
 
 describe("classifyFailure", () => {
@@ -156,6 +156,23 @@ describe("catalog", () => {
   test("suggests the MLX equivalent of a PyTorch checkpoint", () => {
     expect(suggestMlxRepo("openai/whisper-large-v3")).toBe("mlx-community/whisper-large-v3-mlx");
     expect(suggestMlxRepo("openai/whisper-tiny")).toBe("mlx-community/whisper-tiny-mlx");
+  });
+});
+
+describe("configured model resolution", () => {
+  test("an explicit default wins over config", () => {
+    expect(configuredModel("tiny", "turbo")).toBe("tiny");
+  });
+
+  test("config names the model when no default is stored", () => {
+    expect(configuredModel(null, "turbo-q4")).toBe("turbo-q4");
+    expect(configuredModel("", "small")).toBe("small");
+  });
+
+  test("none means ASR is not configured", () => {
+    expect(configuredModel(null, "none")).toBe("none");
+    expect(configuredModel("none", "none")).toBe("none");
+    expect(effectiveDefault(null)).toBe("none");
   });
 });
 

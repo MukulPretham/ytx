@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   cleanLine,
+  duplicateLineRatioOf,
   collapseRolling,
   endsWithTerminalPunctuation,
   isRollingTrack,
@@ -160,6 +161,17 @@ describe("normalizeTrack", () => {
       { start: 2, end: 3, text: "こんにちは世界です" },
     ];
     expect(collapseRolling(cues).map((cue) => cue.text)).toEqual(["こんにちは", "世界", "です"]);
+  });
+});
+
+describe("duplicateLineRatioOf", () => {
+  test("counts repeats after stripping punctuation and case", () => {
+    expect(duplicateLineRatioOf(["La la la", "la la la!", "something else"])).toBeCloseTo(1 / 3, 5);
+  });
+
+  test("ignores blank lines and returns zero for an empty list", () => {
+    expect(duplicateLineRatioOf(["", "   ", "one"])).toBe(0);
+    expect(duplicateLineRatioOf([])).toBe(0);
   });
 });
 
