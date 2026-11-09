@@ -130,6 +130,10 @@ export async function fetchInfo(url: string, options: DownloaderOptions): Promis
   const result = await run(options.binary, [...baseArgs(options), "-J", url], {
     timeoutMs: options.timeoutMs ?? 120_000,
     onStderrLine: options.onLine,
+    // `-J` output is not small: a four-minute video can produce 8 MB of
+    // format metadata. The default 4 MB tail would keep only the end of the
+    // JSON and make it unparseable, so metadata reads get their own ceiling.
+    captureLimit: 64 * 1024 * 1024,
   });
 
   if (result.code !== 0) {
