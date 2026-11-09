@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.ytx/
+*.log
+.DS_Store
