@@ -19,7 +19,7 @@ import { failAfterEmit, resolveFfmpegPath } from "./context.ts";
 import { configuredModel, listInstalled, verifyModel } from "../models/manager.ts";
 import { modelDirName } from "../models/catalog.ts";
 import { ensureVenv, findUv, installUv, uvVersionSync, venvStatus } from "../asr/venv.ts";
-import { installYtdlp, rollbackYtdlp, ytdlpVersion } from "../ytdlp/binary.ts";
+import { installYtdlp, rollbackYtdlp, writeVersionFile, ytdlpVersion } from "../ytdlp/binary.ts";
 import { fetchInfo, readVersion } from "../ytdlp/run.ts";
 import { provenanceCounts } from "./render.ts";
 import { runWizard, wizardDefaults, type WizardChoices } from "../wizard.ts";
@@ -439,7 +439,9 @@ export async function cmdUpdate(context: CommandContext, flags: UpdateFlags): Pr
     const outdated = installed !== latest;
     const resolved =
       context.downloader.available === false ? null : await readVersion(context.downloader.binary);
-    context.ui.line(`installed  ${installed ?? "none"} (managed)`);
+    context.ui.line(
+      `installed  ${installed ?? "none"}${context.config.ytdlp === "system" ? " (managed copy, not used: ytdlp = system)" : " (managed)"}`,
+    );
     context.ui.line(
       `resolved   ${resolved ?? "none"} (${context.downloader.source}: ${context.downloader.available === false ? "not available" : context.downloader.binary})`,
     );
@@ -632,6 +634,7 @@ async function adoptBinary(
     }
     renameSync(staged, context.runtime.ytdlp);
     chmodSync(context.runtime.ytdlp, 0o755);
+    writeVersionFile(context.runtime, version);
 
     context.state.ytdlp = {
       version,
@@ -644,6 +647,11 @@ async function adoptBinary(
 
     context.ui.ok(`adopted yt-dlp ${version} from ${source}`);
     if (previous) context.ui.line(`  previous ${previous} kept at bin/yt-dlp.prev`);
+    if (context.config.ytdlp === "system") {
+      context.ui.warn(
+        'config.toml sets ytdlp = "system", so the PATH binary is still the one ytx uses; set `ytdlp = "auto"` to prefer this copy',
+      );
+    }
     context.ui.emit({
       action: "update",
       channel,
@@ -850,7 +858,7 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
   const modelRows: DoctorReport["models"] = [];
   for (const model of installed) {
     const verification = verifyModel(context.runtime, model.name);
-    const isDefault = model.name === defaultName;
+    const isDefault = model.name === modelDirName(defaultName);
     modelRows.push({
       name: model.name,
       default: isDefault,

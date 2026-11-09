@@ -75,6 +75,7 @@ export async function cmdModels(
 function list(context: CommandContext): void {
   const installed = listInstalled(context.runtime);
   const defaultName = configuredModel(context.state.default_model, context.config.asr_model);
+  const defaultKey = modelDirName(defaultName);
   const rows: string[][] = [];
 
   if (!context.flags.json) {
@@ -84,7 +85,7 @@ function list(context: CommandContext): void {
   }
 
   for (const entry of installed) {
-    const isDefault = entry.name === defaultName;
+    const isDefault = entry.name === defaultKey;
     rows.push([
       `${isDefault ? "*" : " "} ${entry.name}${isDefault ? context.ui.dim(" (default)") : ""}`,
       formatBytes(entry.total_bytes),
@@ -113,7 +114,7 @@ function list(context: CommandContext): void {
       name: entry.name,
       path: entry.path,
       bytes: entry.total_bytes,
-      default: entry.name === defaultName,
+      default: entry.name === defaultKey,
       repo: entry.manifest?.repo ?? null,
       revision: entry.manifest?.revision ?? null,
       catalog: entry.manifest?.catalog ?? false,

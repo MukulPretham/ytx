@@ -239,6 +239,6 @@ export async function rollbackYtdlp(runtime: RuntimePaths): Promise<{ version: s
   return { version: previousVersion, previous: currentVersion };
 }
 
-function writeVersionFile(runtime: RuntimePaths, version: string): void {
+export function writeVersionFile(runtime: RuntimePaths, version: string): void {
   writeFileSync(join(runtime.bin, "yt-dlp.version"), `${version}\n`, "utf8");
 }
