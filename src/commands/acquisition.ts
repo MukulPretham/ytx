@@ -218,7 +218,11 @@ export async function acquireTranscript(
         cues: normalized.cues,
         durationS: input.durationS,
         trackLanguage: trackKey,
-        wantLanguage: step.language === "auto" ? "auto" : options.language,
+        // The gate verifies that the body matches the track's own language tag;
+        // the user's preference is enforced by the ladder order, not here.
+        // Otherwise tier 2 (human captions in another language) could never
+        // pass, contradicting "language is a preference, not a filter".
+        wantLanguage: step.language === "auto" ? "auto" : step.language,
         detected,
         duplicateLineRatio: normalized.duplicate_line_ratio,
         source: step.source,
@@ -346,7 +350,9 @@ async function runAsr(
     ffmpeg: context.ffmpeg,
     modelPath,
     modelName: name,
-    language: context.config.language === "auto" ? "auto" : context.config.language,
+    // Use the language the command was asked for, not the stored config: the
+    // `--language` flag must reach Whisper. "auto" lets it detect the audio.
+    language: options.language === "auto" ? "auto" : options.language,
     audioPath,
     workDir: join(workRoot, "asr"),
     onLine: context.flags.debug ? (line) => context.ui.note(`    ${line}`) : undefined,

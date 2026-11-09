@@ -4,6 +4,7 @@ import {
   planLadder,
   resolvePreferredLanguage,
   tracksFor,
+  untranslatedTracksFor,
   type Availability,
 } from "../src/captions/ladder.ts";
 
@@ -38,20 +39,20 @@ describe("resolvePreferredLanguage", () => {
 });
 
 describe("planLadder", () => {
-  test("tries human captions first, then machine, then ASR", () => {
+  test("tries human captions first, then ASR; platform auto captions are not acquired", () => {
     const plan = planLadder(availability(), { preferredLanguage: "en", quality: "auto" });
     expect(plan.steps.map((step) => [step.tier, step.source])).toEqual([
       [1, "caption-human"],
       [2, "caption-human"],
-      [3, "caption-auto"],
       [4, "asr"],
     ]);
+    expect(plan.skipped.some((entry) => entry.tier === 3)).toBe(true);
   });
 
-  test("skips machine captions under quality=best", () => {
-    const plan = planLadder(availability(), { preferredLanguage: "en", quality: "best" });
-    expect(plan.steps.map((step) => step.tier)).toEqual([1, 2, 4]);
-    expect(plan.skipped.some((entry) => entry.tier === 3)).toBe(true);
+  test("quality=best and quality=auto plan the same tiers now", () => {
+    const auto = planLadder(availability(), { preferredLanguage: "en", quality: "auto" });
+    const best = planLadder(availability(), { preferredLanguage: "en", quality: "best" });
+    expect(best.steps.map((step) => step.tier)).toEqual(auto.steps.map((step) => step.tier));
   });
 
   test("--asr skips every caption tier", () => {
@@ -61,9 +62,9 @@ describe("planLadder", () => {
     expect(plan.steps[0]!.source).toBe("asr");
   });
 
-  test("--no-asr stops after platform captions", () => {
+  test("--no-asr stops after human captions", () => {
     const plan = planLadder(availability(), { preferredLanguage: "en", quality: "auto", noAsr: true });
-    expect(plan.steps.map((step) => step.tier)).toEqual([1, 2, 3]);
+    expect(plan.steps.map((step) => step.tier)).toEqual([1, 2]);
     expect(plan.steps.every((step) => step.source !== "asr")).toBe(true);
   });
 
@@ -73,7 +74,7 @@ describe("planLadder", () => {
       quality: "auto",
       strictLang: true,
     });
-    expect(plan.steps.map((step) => step.tier)).toEqual([1, 3, 4]);
+    expect(plan.steps.map((step) => step.tier)).toEqual([1, 4]);
     expect(plan.skipped.some((entry) => entry.tier === 2)).toBe(true);
   });
 
@@ -105,6 +106,34 @@ describe("planLadder", () => {
     expect(new Set(keys).size).toBe(keys.length);
   });
 
+  test("never plans any platform auto-caption track, translated or not", () => {
+    const plan = planLadder(
+      {
+        human: {},
+        auto: {
+          ko: [{ ext: "vtt", url: "https://example/ko.vtt" }],
+          en: [{ ext: "vtt", url: "https://example/en.vtt?tlang=en", translated: true }],
+        },
+        originalLanguage: "ko",
+      },
+      { preferredLanguage: "en", quality: "auto" },
+    );
+    expect(plan.steps.map((step) => step.tier)).toEqual([4]);
+    expect(plan.skipped.some((entry) => entry.tier === 3)).toBe(true);
+  });
+
+  test("falls through to ASR when a video has only machine captions", () => {
+    const plan = planLadder(
+      {
+        human: {},
+        auto: { en: [{ ext: "vtt", url: "https://example/en.vtt" }] },
+        originalLanguage: "en",
+      },
+      { preferredLanguage: "en", quality: "auto" },
+    );
+    expect(plan.steps.map((step) => step.tier)).toEqual([4]);
+  });
+
   test("auto preference follows the video's original language", () => {
     const plan = planLadder(availability({ originalLanguage: "es" }), {
       preferredLanguage: "auto",
@@ -125,6 +154,26 @@ describe("tracksFor", () => {
 
   test("returns nothing when the language is absent", () => {
     expect(tracksFor({ es: [{ ext: "vtt", url: "u" }] }, "en")).toEqual([]);
+  });
+});
+
+describe("untranslatedTracksFor", () => {
+  test("keeps original-language tracks and drops tlang translations", () => {
+    expect(
+      untranslatedTracksFor(
+        {
+          ko: [{ ext: "vtt", url: "https://example/ko.vtt" }],
+          en: [{ ext: "vtt", url: "https://example/en.vtt?tlang=en", translated: true }],
+        },
+        "ko",
+      ),
+    ).toEqual(["ko"]);
+    expect(
+      untranslatedTracksFor(
+        { en: [{ ext: "vtt", url: "https://example/en.vtt?tlang=en", translated: true }] },
+        "en",
+      ),
+    ).toEqual([]);
   });
 });
 

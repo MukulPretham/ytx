@@ -15,6 +15,11 @@ export interface CaptionFormat {
   ext: string;
   url: string;
   name?: string | null;
+  /**
+   * True when the URL carries `tlang`, i.e. the platform is offering a machine
+   * translation of the ASR track rather than the ASR output itself.
+   */
+  translated?: boolean;
 }
 
 export type TrackMap = Record<string, CaptionFormat[]>;
@@ -140,31 +145,21 @@ export function planLadder(
     }
   }
 
-  // Tier 3 - the platform's own speech recognition.
-  if (options.quality === "best") {
-    skipped.push({ tier: 3, reason: "--quality best skips platform machine captions" });
-  } else {
-    const autoPreferred = tracksFor(availability.auto, preferred);
-    if (autoPreferred.length === 0) {
-      skipped.push({ tier: 3, reason: `no machine caption track in ${preferred}` });
-    }
-    for (const key of autoPreferred) {
-      push(
-        {
-          tier: 3,
-          source: "caption-auto",
-          language: normalizeLangTag(key),
-          trackKey: key,
-          reason: `platform machine captions in ${preferred}`,
-        },
-        `auto:${key}`,
-      );
-    }
-  }
+  // Tier 3 is deliberately absent in this build. Platform machine captions
+  // were unreliable (YouTube answered HTTP 429 for the timedtext track, and
+  // the translated `tlang` variants were blocked outright), and the captain's
+  // instruction is: use human captions, otherwise transcribe locally. The
+  // `caption-auto` provenance remains in the schema so libraries archived
+  // before this change stay readable and searchable.
+  skipped.push({
+    tier: 3,
+    reason:
+      "platform machine captions are not acquired in this build; human captions or local transcription only",
+  });
 
   // Tier 4 - local transcription.
   if (options.noAsr) {
-    skipped.push({ tier: 4, reason: "--no-asr stops after platform captions" });
+    skipped.push({ tier: 4, reason: "--no-asr stops after human captions" });
   } else {
     push(
       {
@@ -188,6 +183,20 @@ export function planLadder(
 export function tracksFor(map: TrackMap, language: string): string[] {
   const wanted = normalizeLangTag(language);
   const candidates = Object.keys(map).filter((key) => normalizeLangTag(key) === wanted);
+  return orderTrackKeys(candidates);
+}
+
+/**
+ * Track keys whose language matches and which include at least one URL that is
+ * the platform's own ASR output, not a `tlang` translation of it.
+ */
+export function untranslatedTracksFor(map: TrackMap, language: string): string[] {
+  const wanted = normalizeLangTag(language);
+  const candidates = Object.keys(map).filter((key) => {
+    if (normalizeLangTag(key) !== wanted) return false;
+    const formats = map[key] ?? [];
+    return formats.some((format) => !format.translated);
+  });
   return orderTrackKeys(candidates);
 }
 

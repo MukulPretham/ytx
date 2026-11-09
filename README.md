@@ -25,9 +25,9 @@ What lands on disk:
   transcript.txt         the same text, readable
 ```
 
-Every transcript records where it came from, and the three cases are never
-collapsed into two: human-written captions (`H`), the platform's own speech
-recognition (`A`), and a local Whisper model (`M`).
+Every transcript records where it came from: human-written captions (`H`),
+the platform's own speech recognition (`A`, legacy records only in this build),
+and a local Whisper model (`M`). The three values are never collapsed into two.
 
 ```
 $ ytx list
@@ -99,9 +99,9 @@ ytx add <url> [<url>...] [options]
 | --- | --- |
 | `--max-height 1080` | ceiling for the archived video track |
 | `--language en` | preferred caption language, or `auto` for the video's own |
-| `--quality auto\|best` | `best` skips the platform's machine captions |
+| `--quality auto\|best` | accepted for compatibility; platform machine captions are not acquired |
 | `--asr` | force local transcription |
-| `--no-asr` | stop after platform captions (exit 4 when none exist) |
+| `--no-asr` | stop after human captions (exit 4 when none exist) |
 | `--strict-lang` | never fall back to another language |
 | `--allow-repetitive` | bypass the repetition gate for any source |
 | `--parallel 2` | concurrent adds and transcriptions |
@@ -288,6 +288,24 @@ bunx tsc --noEmit     # type check
 See [`docs/architecture.md`](docs/architecture.md) for the directory split, the
 provenance model, the acquisition ladder, and why each dependency exists.
 
+## Caption sources in this build
+
+`ytx` acquires **human captions** when the platform has them (preferred language
+first, then another language), and otherwise **transcribes locally** with
+Whisper. Platform machine captions are not acquired: YouTube's `timedtext`
+endpoint rate-limited them with HTTP 429 (the translated `tlang` variants were
+blocked outright), and a deterministic human-or-model pipeline is more useful
+than a source that intermittently fails.
+
+Consequences:
+
+- `--quality auto` and `--quality best` behave the same; the flag is kept for
+  compatibility.
+- `--no-asr` on a video with no human captions exits `4`.
+- The `caption-auto` provenance (`A`) remains in the schema and in `list`,
+  `search --source caption-auto` and `doctor`, so a library archived before
+  this change stays readable. New adds never produce it.
+
 ## Limits in v1
 
 No playlist or channel sync (`ytx sync` exits `2` and says it is not implemented
@@ -295,10 +313,9 @@ in v1), no translation, no speaker diarization, no summarization, no web
 interface, one extractor backend (`yt-dlp`), no cross-device sync service, no
 punctuation restoration.
 
-Two deliberate consequences of the specified rules are worth knowing:
+Two deliberate consequences of the rules are worth knowing:
 
-- The repetition gate applies to platform machine captions. Human captions that
-  repeat a chorus are accepted with a recorded warning; `--allow-repetitive`
-  silences the check for any source.
-- `setup` installs no model unless asked, so `ytx add` on a video with no
+- Human captions that repeat a chorus are accepted with a recorded warning;
+  `--allow-repetitive` silences the repetition check.
+- `setup` installs no model unless asked, so `ytx add` on a video with no human
   captions exits `2` and names the catalog instead of downloading weights.

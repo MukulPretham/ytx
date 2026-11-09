@@ -191,10 +191,20 @@ function normalizeTracks(source: Record<string, CaptionFormatRecord[]> | undefin
         ext: typeof format.ext === "string" ? format.ext : "vtt",
         url: String(format.url),
         name: format.name ?? null,
+        translated: isTranslatedUrl(String(format.url)),
       }));
     if (usable.length > 0) out[language] = usable;
   }
   return out;
+}
+
+/** `tlang` marks a machine translation of the ASR track, not the track itself. */
+function isTranslatedUrl(url: string): boolean {
+  try {
+    return new URL(url).searchParams.has("tlang");
+  } catch {
+    return false;
+  }
 }
 
 /** Prefer WebVTT, then SRT; the platform serves both. */

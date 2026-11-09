@@ -56,15 +56,21 @@ caption-auto    the platform's own ASR output  A
 asr             local Whisper                  M
 ```
 
-The distinction that matters is `caption-human` versus `caption-auto`. Machine
-captions are a model's output that happens to live on the platform; local Whisper
-is a model's output that lives here. Recording both as "machine" would make the
-most useful distinction in the library unanswerable: did a human write this, or
-did a model guess at it?
+The distinction that mattered when all three were acquired is `caption-human`
+versus `caption-auto`: machine captions are a model's output that happens to
+live on the platform, while local Whisper is a model's output that lives here.
+Recording both as "machine" would make the most useful distinction in the
+library unanswerable: did a human write this, or did a model guess at it? The
+schema keeps all three values so libraries archived before the change stay
+distinguishable; new adds produce `caption-human` or `asr`.
 
 Provenance surfaces everywhere: `list` prints `H`/`A`/`M`, `show` prints a
 provenance header that `--raw` suppresses, `search --source caption-human`
 filters, `doctor` prints the distribution, and `meta.json` stores it.
+
+`caption-auto` is a **legacy** value in this build: new adds never produce it
+(see "Acquisition ladder" below), but libraries archived before the change keep
+validating, listing and searching it.
 
 Alongside the source, `meta.json` records what makes the transcript reproducible:
 
@@ -92,12 +98,18 @@ The first tier that passes the gates wins.
 
 1. human captions in the preferred language
 2. human captions in another language (the actual language is recorded)
-3. the platform's machine captions in the preferred language
+3. **not used in this build** - platform machine captions
 4. local transcription from the audio
 
-`--quality best` skips tier 3, `--asr` forces tier 4, `--no-asr` stops after tier
-3 (exit 4 when nothing passes), `--strict-lang` turns the preference into a hard
-filter and removes tier 2.
+Platform machine captions were removed deliberately. YouTube's `timedtext`
+endpoint answered HTTP 429 for the automatic track (and always for the
+translated `tlang` variants), so a video with only machine captions could fail
+intermittently. The instruction is now: use human captions, otherwise transcribe
+locally. The ladder falls through to tier 4 when no human track exists or every
+human track fails a gate. `--quality auto` and `--quality best` are equivalent;
+the flag remains for compatibility. `--asr` forces tier 4, `--no-asr` stops
+after tier 2 (exit 4 when nothing passes), `--strict-lang` turns the preference
+into a hard filter and removes tier 2.
 
 Language is a preference, not a filter: a video whose original language is
 Spanish still yields Spanish captions for a user who asked for English, and tier
@@ -124,7 +136,7 @@ would send it to a worse source for a property that is not a defect:
 
 | source | duplicate lines over 25% |
 | --- | --- |
-| `caption-auto` | rejection; the ladder falls through |
+| `caption-auto` (legacy) | rejection; the ladder falls through |
 | `caption-human` | accepted, with a warning recorded in `meta.json` |
 | `asr` | accepted, with a report-only warning |
 
@@ -265,6 +277,10 @@ PyTorch or GGUF checkpoint gets the likely MLX equivalent named.
 `init`, `setup`, `update`, `doctor`, `add`, `transcript`, `show`, `list`,
 `search`, `retry`, `rm`, `prune`, `models`, and `sync` (which exits `2` and says
 it is not implemented in v1).
+
+`--quality` is accepted but no longer changes the plan: platform machine
+captions are not acquired. `caption-auto` records remain readable and
+searchable.
 
 Notable flag surface:
 

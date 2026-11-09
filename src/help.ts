@@ -15,7 +15,7 @@ commands
   add          archive one or more videos
   transcript   re-acquire a transcript for an archived video
   show         print a transcript with its provenance header
-  list         list archived videos (H human / A machine / M local)
+  list         list archived videos (H human / A legacy machine / M local)
   search       search archived transcripts
   retry        drain queue.jsonl
   rm           delete archived videos
@@ -94,9 +94,9 @@ Archive video, audio and transcript. The transcript is acquired first so
 
   --max-height <n>             video height ceiling (default 1080)
   --language <code>            preferred caption language (or "auto")
-  --quality auto|best          "best" skips platform machine captions
+  --quality auto|best          accepted for compatibility; platform machine captions are not acquired
   --asr                        force local transcription
-  --no-asr                     stop after platform captions (exit 4 if none)
+  --no-asr                     stop after human captions (exit 4 if none)
   --strict-lang                never fall back to another language
   --allow-repetitive           bypass the repetition gate for any source
   --parallel <n>               concurrent transcriptions
@@ -114,7 +114,7 @@ archived 11-character id, read the store and print it.
   --timestamps                   prefix each segment with its start time
   --language <code>              preferred caption language (URL mode)
   --asr                          force local transcription (URL mode)
-  --no-asr                       stop after platform captions
+  --no-asr                       stop after human captions
   --strict-lang                  never fall back to another language
   --allow-repetitive             bypass the repetition gate
 `,
