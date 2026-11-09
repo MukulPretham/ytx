@@ -5,11 +5,11 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { defaultConfig, loadConfig, saveConfig, type Config } from "../core/config.ts";
-import { SilentExit, usageError, type YtxError } from "../core/errors.ts";
+import { SilentExit, fetchError, type YtxError } from "../core/errors.ts";
 import { resolvePaths, type LibraryPaths, type Paths, type RuntimePaths } from "../core/paths.ts";
 import { loadState, type State } from "../core/state.ts";
 import { Ui } from "../core/ui.ts";
-import { resolveDownloader, type DownloaderOptions } from "../ytdlp/run.ts";
+import { readVersion, resolveDownloader, type DownloaderOptions, type YtdlpSource } from "../ytdlp/run.ts";
 import { findUv } from "../asr/venv.ts";
 
 export interface GlobalFlags {
@@ -41,6 +41,8 @@ export function buildContext(flags: GlobalFlags, env = process.env, cwd = proces
   const paths = resolvePaths({ env, cwd, store: flags.store });
   mkdirSync(paths.runtime.root, { recursive: true });
 
+  const config = loadConfig(paths.library);
+  const downloader = resolveDownloader(paths.runtime, config.ytdlp);
   const context: CommandContext = {
     ui,
     flags,
@@ -48,9 +50,11 @@ export function buildContext(flags: GlobalFlags, env = process.env, cwd = proces
     runtime: paths.runtime,
     library: paths.library,
     state: loadState(paths.runtime.state),
-    config: loadConfig(paths.library),
+    config,
     downloader: {
-      binary: resolveDownloader(paths.runtime),
+      binary: downloader.binary,
+      source: downloader.source,
+      available: downloader.available,
       browser: "",
       onLine: flags.debug ? (line) => ui.note(line) : undefined,
     },
@@ -59,7 +63,13 @@ export function buildContext(flags: GlobalFlags, env = process.env, cwd = proces
     reload: () => {
       context.state = loadState(paths.runtime.state);
       context.config = loadConfig(paths.library);
-      context.downloader = { ...context.downloader, binary: resolveDownloader(paths.runtime) };
+      const next = resolveDownloader(paths.runtime, context.config.ytdlp);
+      context.downloader = {
+        ...context.downloader,
+        binary: next.binary,
+        source: next.source,
+        available: next.available,
+      };
       context.ffmpeg = resolveFfmpegPath(paths.runtime);
       context.uv = findUv(paths.runtime);
     },
@@ -76,13 +86,39 @@ export function resolveFfmpegPath(runtime: RuntimePaths): string {
 export function requireFfmpeg(context: CommandContext): string {
   const path = context.ffmpeg;
   if (!existsSync(path) && Bun.which("ffmpeg") === null) {
-    throw usageError(
+    throw fetchError(
       "ffmpeg",
       "is not installed, and it is required to mux media and transcribe audio",
       "run `ytx setup` to install a static build",
     );
   }
   return path;
+}
+
+/**
+ * Preflight for commands that need the downloader. Runs before anything in the
+ * library is created, so a missing binary leaves the store byte-identical.
+ */
+export async function requireDownloader(
+  context: CommandContext,
+): Promise<{ binary: string; version: string; source: YtdlpSource }> {
+  const { binary, source, available } = context.downloader;
+  const version = available === false ? null : await readVersion(binary);
+  if (version !== null) return { binary, version, source };
+
+  const why =
+    context.config.ytdlp === "system"
+      ? `no yt-dlp was found on PATH, and config.toml sets ytdlp = "system" (${binary})`
+      : context.config.ytdlp === "managed"
+        ? `${binary} is missing or does not run, and config.toml sets ytdlp = "managed"`
+        : `${binary} is missing or does not run`;
+  throw fetchError(
+    "yt-dlp",
+    why,
+    context.config.ytdlp === "system"
+      ? "install yt-dlp on PATH, or set `ytdlp = \"auto\"` in config.toml and run `ytx setup`"
+      : "run `ytx setup` to install it",
+  );
 }
 
 /**

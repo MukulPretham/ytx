@@ -15,8 +15,14 @@ import type { RuntimePaths } from "../core/paths.ts";
 import { classifyFailure, type Classified } from "./classify.ts";
 import type { Availability, CaptionFormat } from "../captions/ladder.ts";
 
+export type YtdlpSource = "managed" | "system";
+
 export interface DownloaderOptions {
   binary: string;
+  /** Whether `binary` is the runtime copy or a yt-dlp found on PATH. */
+  source: YtdlpSource;
+  /** False when the configured mode has no binary at all (e.g. system with no PATH install). */
+  available?: boolean;
   /** Browser to read cookies from, for bot-check resilience. "" means none. */
   browser?: string;
   /** Alternate player client, used after a format-unavailable failure. */
@@ -59,6 +65,8 @@ interface RawFormat {
 export interface InfoResult {
   info: YtdlpRawInfo;
   version: string;
+  /** Which binary produced this metadata; recorded alongside every caption. */
+  source: YtdlpSource;
   availability: Availability;
 }
 
@@ -75,13 +83,31 @@ export function baseArgs(options: DownloaderOptions): string[] {
 }
 
 /**
- * Which binary to use: the runtime-managed one always, with a PATH fallback so
- * `doctor` can still diagnose a machine whose runtime is not set up yet.
+ * Which binary to use, following `config.ytdlp`:
+ *
+ *   auto     the runtime copy when it exists, else a yt-dlp on PATH
+ *   managed  only the runtime copy; never a PATH binary
+ *   system   only a yt-dlp on PATH; never the runtime copy
+ *
+ * The fallback exists because a GitHub outage must not make the whole tool
+ * unusable on a machine that already has yt-dlp installed.
  */
-export function resolveDownloader(runtime: RuntimePaths): string {
-  if (existsSync(runtime.ytdlp)) return runtime.ytdlp;
-  const which = Bun.which("yt-dlp");
-  return which ?? runtime.ytdlp;
+export function resolveDownloader(
+  runtime: RuntimePaths,
+  mode: "auto" | "managed" | "system" = "auto",
+): { binary: string; source: YtdlpSource; available: boolean } {
+  const system = Bun.which("yt-dlp");
+  if (mode === "system") {
+    return system
+      ? { binary: system, source: "system", available: true }
+      : { binary: runtime.ytdlp, source: "system", available: false };
+  }
+  if (mode === "managed") {
+    return { binary: runtime.ytdlp, source: "managed", available: existsSync(runtime.ytdlp) };
+  }
+  if (existsSync(runtime.ytdlp)) return { binary: runtime.ytdlp, source: "managed", available: true };
+  if (system) return { binary: system, source: "system", available: true };
+  return { binary: runtime.ytdlp, source: "managed", available: false };
 }
 
 export async function readVersion(binary: string): Promise<string | null> {
@@ -121,7 +147,7 @@ export async function fetchInfo(url: string, options: DownloaderOptions): Promis
     );
   }
 
-  return { info, version, availability: availabilityOf(info) };
+  return { info, version, source: options.source, availability: availabilityOf(info) };
 }
 
 /** Turn a failed yt-dlp run into an error whose class drives the caller's response. */

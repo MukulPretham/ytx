@@ -46,12 +46,14 @@ function sample(overrides: Partial<Meta> = {}): Meta {
       source: "caption-human",
       language: "en",
       ytdlp_version: "2024.08.06",
+      ytdlp_source: "managed",
       coverage: 0.98,
       segments: 812,
       chars: 24103,
       fetched_at: "2024-08-06T12:00:00.000Z",
     },
     transcript_history: [],
+    warnings: [],
     added_at: "2024-08-06T12:00:00.000Z",
     updated_at: "2024-08-06T12:00:00.000Z",
     ...overrides,
@@ -126,6 +128,38 @@ describe("meta record", () => {
         }),
       ),
     ).toThrow(/required for asr/);
+    lib.cleanup();
+  });
+
+  test("accepts a pre-A7 caption record without ytdlp_source", () => {
+    const lib = library();
+    const legacy = sample();
+    delete (legacy.transcript as { ytdlp_source?: string }).ytdlp_source;
+    writeMeta(lib.paths, legacy);
+    expect(readMeta(lib.paths, ID).transcript.ytdlp_version).toBe("2024.08.06");
+    lib.cleanup();
+  });
+
+  test("rejects ytdlp_source on an asr record", () => {
+    const lib = library();
+    expect(() =>
+      writeMeta(
+        lib.paths,
+        sample({
+          transcript: {
+            source: "asr",
+            language: "en",
+            model: "whisper-large-v3-turbo",
+            model_revision: "abc123",
+            ytdlp_source: "managed",
+            coverage: 1,
+            segments: 3,
+            chars: 30,
+            fetched_at: "2024-08-06T12:00:00.000Z",
+          },
+        }),
+      ),
+    ).toThrow(/caption-only field/);
     lib.cleanup();
   });
 

@@ -3,8 +3,64 @@
  * Kept apart from the commands so the provenance header has exactly one owner.
  */
 
-import { PROVENANCE_LABELS, PROVENANCE_MARKERS, type Meta, type Provenance } from "../core/schema.ts";
+import { PROVENANCE_LABELS, PROVENANCE_MARKERS, type Meta, type Provenance, type TranscriptSegment } from "../core/schema.ts";
 import { formatDuration } from "../core/ui.ts";
+import { formatTimestamp } from "../captions/vtt.ts";
+
+export const TRANSCRIPT_FORMATS = ["txt", "json", "srt", "vtt", "md"] as const;
+export type TranscriptFormat = (typeof TRANSCRIPT_FORMATS)[number];
+
+/**
+ * One renderer for every command that prints a transcript, so `show`, `transcript`
+ * and any future export agree on what each format means.
+ */
+export function renderTranscript(
+  segments: readonly TranscriptSegment[],
+  format: TranscriptFormat = "txt",
+  options: { timestamps?: boolean } = {},
+): string {
+  const timestamps = options.timestamps ?? false;
+  switch (format) {
+    case "json":
+      return `${JSON.stringify(segments, null, 2)}\n`;
+    case "srt":
+      return segments
+        .map((segment, index) => {
+          const start = formatTimestamp(segment.start, ",");
+          const end = formatTimestamp(segment.end, ",");
+          return `${index + 1}\n${start} --> ${end}\n${segment.text}`;
+        })
+        .join("\n\n") + "\n";
+    case "vtt":
+      return (
+        "WEBVTT\n\n" +
+        segments
+          .map((segment, index) => {
+            const start = formatTimestamp(segment.start);
+            const end = formatTimestamp(segment.end);
+            return `${index + 1}\n${start} --> ${end}\n${segment.text}`;
+          })
+          .join("\n\n") +
+        "\n"
+      );
+    case "md":
+      return segments
+        .map((segment) =>
+          timestamps
+            ? `**${formatClock(segment.start)}** ${segment.text}`
+            : segment.text,
+        )
+        .join("\n\n") + "\n";
+    default:
+      return segments
+        .map((segment) =>
+          timestamps
+            ? `[${formatClock(segment.start)}] ${segment.text}`
+            : segment.text,
+        )
+        .join("\n\n") + "\n";
+  }
+}
 
 export function provenanceLine(meta: Meta): string {
   const transcript = meta.transcript;
@@ -22,7 +78,7 @@ export function provenanceLine(meta: Meta): string {
     const revision = transcript.model_revision ? `@${transcript.model_revision.slice(0, 8)}` : "";
     bits.push(`model ${model}${revision}`);
   } else if (transcript.ytdlp_version) {
-    bits.push(`yt-dlp ${transcript.ytdlp_version}`);
+    bits.push(`yt-dlp ${transcript.ytdlp_version}${transcript.ytdlp_source ? ` (${transcript.ytdlp_source})` : ""}`);
   }
   return bits.join(" · ");
 }

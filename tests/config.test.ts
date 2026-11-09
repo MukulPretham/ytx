@@ -21,9 +21,10 @@ describe("defaultConfig", () => {
     expect(config.language).toBe("en");
     expect(config.max_height).toBe(1080);
     expect(config.quality).toBe("auto");
-    expect(config.asr_model).toBe("turbo");
+    expect(config.asr_model).toBe("none");
     expect(config.parallel).toBe(1);
     expect(config.browser).toBe("");
+    expect(config.ytdlp).toBe("auto");
     expect(config.ytdlp_channel).toBe("stable");
     expect(config.canary_urls.length).toBeGreaterThanOrEqual(2);
   });

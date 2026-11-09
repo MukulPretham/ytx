@@ -10,7 +10,7 @@
 import { intro, isCancel, log, note, outro, select, text } from "@clack/prompts";
 import { rmSync } from "node:fs";
 import { YtxError } from "./core/errors.ts";
-import { CATALOG, DEFAULT_MODEL_NAME, parseRepoInput } from "./models/catalog.ts";
+import { CATALOG, parseRepoInput } from "./models/catalog.ts";
 import { fetchRepoInfo, notACheckpointError } from "./models/hub.ts";
 import { formatBytes } from "./core/ui.ts";
 import type { CommandContext } from "./commands/context.ts";
@@ -58,7 +58,9 @@ export function wizardDefaults(
   return {
     library: context.library.root,
     language: overrides.language || context.config.language || "en",
-    model: overrides.model || context.config.asr_model || DEFAULT_MODEL_NAME,
+    // A3: no model unless the user asks for one. Plain Enter must not pull
+    // 1.5 GB of weights.
+    model: overrides.model || context.config.asr_model || "none",
     // An empty browser means "skip"; "" must not become a selected option.
     browser: overrides.browser || context.config.browser || "skip",
     maxHeight: context.config.max_height,

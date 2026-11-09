@@ -26,6 +26,7 @@ function input(overrides: Partial<GateInput> = {}): GateInput {
     wantLanguage: "en",
     detected: detectLanguage(BODY),
     duplicateLineRatio: 0,
+    source: "caption-auto",
     ...overrides,
   };
 }
@@ -79,6 +80,32 @@ describe("evaluateGates", () => {
 
   test("accepts repetition exactly at the threshold", () => {
     expect(evaluateGates(input({ duplicateLineRatio: REPETITION_MAX })).pass).toBe(true);
+  });
+
+  test("warns instead of rejecting when human captions repeat a chorus", () => {
+    const result = evaluateGates(
+      input({ source: "caption-human", duplicateLineRatio: REPETITION_MAX + 0.2 }),
+    );
+    expect(result.pass).toBe(true);
+    expect(result.failures).toEqual([]);
+    expect(result.warnings.map((warning) => warning.gate)).toEqual(["repetition"]);
+    expect(result.warnings[0]!.detail).toContain("human captions may repeat");
+  });
+
+  test("reports repetition from local ASR without rejecting it", () => {
+    const result = evaluateGates(input({ source: "asr", duplicateLineRatio: 0.5 }));
+    expect(result.pass).toBe(true);
+    expect(result.warnings.map((warning) => warning.gate)).toEqual(["repetition"]);
+    expect(result.warnings[0]!.detail).toContain("report only");
+  });
+
+  test("--allow-repetitive silences the gate for machine captions too", () => {
+    const result = evaluateGates(
+      input({ source: "caption-auto", duplicateLineRatio: 0.9, allowRepetitive: true }),
+    );
+    expect(result.pass).toBe(true);
+    expect(result.failures).toEqual([]);
+    expect(result.warnings).toEqual([]);
   });
 
   test("reports every failing gate at once", () => {

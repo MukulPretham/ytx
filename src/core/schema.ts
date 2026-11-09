@@ -62,6 +62,8 @@ export const TranscriptRecordSchema = z
     model_revision: z.string().min(1).optional(),
     /** yt-dlp version that fetched the track, present only for caption sources. */
     ytdlp_version: z.string().min(1).optional(),
+    /** Which binary fetched it: the runtime copy or one found on PATH. */
+    ytdlp_source: z.enum(["managed", "system"]).optional(),
     coverage: z.number().nonnegative(),
     segments: z.number().int().nonnegative(),
     chars: z.number().int().nonnegative(),
@@ -86,6 +88,13 @@ export const TranscriptRecordSchema = z
           message: "caption-only field, not valid for asr",
         });
       }
+      if (value.ytdlp_source) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["ytdlp_source"],
+          message: "caption-only field, not valid for asr",
+        });
+      }
       return;
     }
     if (!value.ytdlp_version) {
@@ -95,6 +104,9 @@ export const TranscriptRecordSchema = z
         message: "required for caption sources so the fetch can be reproduced",
       });
     }
+    // `ytdlp_source` is written for every new caption record, but it is not
+    // required on read: records archived before the field existed stay valid.
+    // Forbidding it on `asr` above keeps the two provenance shapes distinct.
     if (value.model || value.model_revision) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -120,6 +132,13 @@ export const MetaSchema = z.object({
   media: MediaSchema,
   transcript: TranscriptRecordSchema,
   transcript_history: z.array(TranscriptHistoryEntrySchema),
+  /**
+   * Non-fatal observations about this acquisition, e.g. "human captions repeat
+   * a chorus line 41% of the time; repetition is not a rejection for human
+   * captions". Warnings never block a record; they are the record's own note
+   * about why something that looks odd was accepted.
+   */
+  warnings: z.array(z.string()).default([]),
   added_at: z.string().min(1),
   updated_at: z.string().min(1),
 });

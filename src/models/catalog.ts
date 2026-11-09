@@ -52,6 +52,15 @@ export const CATALOG: CatalogEntry[] = [
 
 export const DEFAULT_MODEL_NAME = "turbo";
 
+/** One line naming every catalog model with its size, for errors and help. */
+export function catalogChoices(): string {
+  return CATALOG.map((entry) => `${entry.name} (~${formatMb(entry.size_mb)})`).join(", ");
+}
+
+function formatMb(mb: number): string {
+  return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`;
+}
+
 export function findCatalogEntry(name: string): CatalogEntry | undefined {
   const lowered = name.trim().toLowerCase();
   return CATALOG.find((entry) => entry.name === lowered || entry.repo.toLowerCase() === lowered);

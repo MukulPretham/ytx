@@ -21,6 +21,7 @@ import {
   cmdShow,
   cmdSync,
   cmdTranscript,
+  parseTranscriptFormat,
   provenanceFilter,
   type AddFlags,
 } from "./commands/library.ts";
@@ -49,6 +50,7 @@ const COMMAND_OPTIONS: Record<string, Record<string, { type: "boolean" | "string
   setup: {
     language: { type: "string" },
     model: { type: "string" },
+    "with-model": { type: "string" },
     browser: { type: "string" },
     force: { type: "boolean" },
   },
@@ -58,8 +60,11 @@ const COMMAND_OPTIONS: Record<string, Record<string, { type: "boolean" | "string
     force: { type: "boolean" },
     all: { type: "boolean" },
     rollback: { type: "boolean" },
+    from: { type: "string" },
   },
-  doctor: {},
+  doctor: {
+    fix: { type: "boolean" },
+  },
   add: {
     "max-height": { type: "string" },
     language: { type: "string" },
@@ -68,10 +73,12 @@ const COMMAND_OPTIONS: Record<string, Record<string, { type: "boolean" | "string
     asr: { type: "boolean" },
     "no-asr": { type: "boolean" },
     "strict-lang": { type: "boolean" },
+    "allow-repetitive": { type: "boolean" },
     parallel: { type: "string" },
     "cookies-from-browser": { type: "string" },
     force: { type: "boolean" },
     "no-media": { type: "boolean" },
+    "transcript-only": { type: "boolean" },
   },
   transcript: {
     language: { type: "string" },
@@ -80,26 +87,35 @@ const COMMAND_OPTIONS: Record<string, Record<string, { type: "boolean" | "string
     asr: { type: "boolean" },
     "no-asr": { type: "boolean" },
     "strict-lang": { type: "boolean" },
+    "allow-repetitive": { type: "boolean" },
+    format: { type: "string" },
+    timestamps: { type: "boolean" },
   },
   show: {
     raw: { type: "boolean" },
     timestamps: { type: "boolean" },
     history: { type: "boolean" },
+    format: { type: "string" },
   },
   list: {
     source: { type: "string" },
     sort: { type: "string" },
     limit: { type: "string" },
+    "missing-transcript": { type: "boolean" },
+    "missing-media": { type: "boolean" },
   },
   search: {
     source: { type: "string" },
     limit: { type: "string" },
     context: { type: "string" },
     id: { type: "string", multiple: true },
+    transcripts: { type: "boolean" },
   },
   retry: {
     all: { type: "boolean" },
     limit: { type: "string" },
+    "max-attempts": { type: "string" },
+    "dry-run": { type: "boolean" },
   },
   rm: {},
   prune: {
@@ -109,6 +125,10 @@ const COMMAND_OPTIONS: Record<string, Record<string, { type: "boolean" | "string
     as: { type: "string" },
     "no-default": { type: "boolean" },
     canary: { type: "boolean" },
+    revision: { type: "string" },
+    path: { type: "string" },
+    force: { type: "boolean" },
+    deep: { type: "boolean" },
   },
   sync: {},
 };
@@ -194,6 +214,7 @@ async function dispatch(
         context,
         {
           language: stringFlag(values, "language"),
+          withModel: stringFlag(values, "with-model"),
           model: stringFlag(values, "model"),
           browser: stringFlag(values, "browser"),
           force: values.force === true,
@@ -208,10 +229,11 @@ async function dispatch(
         force: values.force === true,
         all: values.all === true,
         rollback: values.rollback === true,
+        from: stringFlag(values, "from"),
       });
 
     case "doctor":
-      return cmdDoctor(context);
+      return cmdDoctor(context, { fix: values.fix === true });
 
     case "add": {
       const flags: AddFlags = {
@@ -221,10 +243,11 @@ async function dispatch(
         asr: values.asr === true,
         noAsr: values["no-asr"] === true,
         strictLang: values["strict-lang"] === true,
+        allowRepetitive: values["allow-repetitive"] === true,
         force: values.force === true,
         browser: stringFlag(values, "cookies-from-browser") ?? null,
         parallel: numberFlag(values, "parallel", context.config.parallel),
-        noMedia: values["no-media"] === true,
+        noMedia: values["no-media"] === true || values["transcript-only"] === true,
       };
       if (flags.asr && flags.noAsr) {
         throw usageError("add", "--asr and --no-asr cannot both be set", "pick one");
@@ -239,6 +262,9 @@ async function dispatch(
         asr: values.asr === true,
         noAsr: values["no-asr"] === true,
         strictLang: values["strict-lang"] === true,
+        allowRepetitive: values["allow-repetitive"] === true,
+        format: parseTranscriptFormat(stringFlag(values, "format")),
+        timestamps: values.timestamps === true,
       });
 
     case "show":
@@ -246,6 +272,7 @@ async function dispatch(
         raw: values.raw === true,
         timestamps: values.timestamps === true,
         history: values.history === true,
+        format: parseTranscriptFormat(stringFlag(values, "format")),
       });
 
     case "list":
@@ -253,6 +280,8 @@ async function dispatch(
         source: stringFlag(values, "source"),
         sort: sortFlag(values),
         limit: numberFlag(values, "limit", 0) || undefined,
+        missingTranscript: values["missing-transcript"] === true,
+        missingMedia: values["missing-media"] === true,
       });
 
     case "search": {
@@ -263,6 +292,7 @@ async function dispatch(
         limit: numberFlag(values, "limit", 20),
         context: numberFlag(values, "context", 60),
         ids: Array.isArray(values.id) ? (values.id as string[]) : undefined,
+        transcriptsOnly: values.transcripts === true,
       });
     }
 
@@ -270,6 +300,11 @@ async function dispatch(
       return cmdRetry(context, {
         all: values.all === true,
         limit: numberFlag(values, "limit", 50),
+        maxAttempts:
+          stringFlag(values, "max-attempts") === undefined
+            ? null
+            : numberFlag(values, "max-attempts", 5),
+        dryRun: values["dry-run"] === true,
       });
 
     case "rm":
@@ -285,6 +320,10 @@ async function dispatch(
         noDefault: values["no-default"] === true,
         yes: global.yes,
         canary: values.canary === true,
+        revision: stringFlag(values, "revision"),
+        path: stringFlag(values, "path"),
+        force: values.force === true,
+        deep: values.deep === true,
       });
 
     case "sync":

@@ -46,25 +46,18 @@ export async function fetchRepoInfo(repo: string): Promise<RepoInfo> {
 
   if (response.status !== 200) {
     const body = await response.text().catch(() => "");
-    // The hub answers 401 "Invalid username or password." for repos that do not
-    // exist when the request is unauthenticated, so the body decides the class,
-    // not the status alone.
-    const looksMissing = /invalid username or password/i.test(body) || response.status === 404;
-    if (looksMissing) {
-      throw new YtxError({
-        what: `model repo ${repo}`,
-        why: "does not exist on the hub (or is private)",
-        next: "check the owner/repo spelling, or run `ytx models list` to see the known-good names",
-        code: EXIT.fetch,
-        kind: "model-repo-missing",
-      });
+    // The hub answers 401 "Invalid username or password." for a repo that does
+    // not exist AND for a private/gated one, so a 401 must never be reported as
+    // a 404. Only a real 404 is a definite "not found".
+    if (response.status === 404) {
+      throw missingRepoError(repo, 404);
     }
     if (response.status === 401 || response.status === 403) {
-      throw gatedError(repo, response.status);
+      throw missingRepoError(repo, response.status);
     }
     throw fetchError(
       `model repo ${repo}`,
-      `the hub answered HTTP ${response.status}`,
+      `the hub answered HTTP ${response.status}${body === "" ? "" : ` (${body.slice(0, 120)})`}`,
       "retry `ytx models add` in a few minutes",
       "transient",
     );
@@ -78,10 +71,10 @@ export async function fetchRepoInfo(repo: string): Promise<RepoInfo> {
   };
 
   if (data.private === true) {
-    throw gatedError(repo, 403);
+    throw gatedError(repo);
   }
   if (data.gated !== undefined && data.gated !== false) {
-    throw gatedError(repo, 403, typeof data.gated === "string" ? data.gated : "manual");
+    throw gatedError(repo, typeof data.gated === "string" ? data.gated : "manual");
   }
 
   const files: HubFile[] = (data.siblings ?? [])
@@ -109,11 +102,32 @@ export async function fetchRepoInfo(repo: string): Promise<RepoInfo> {
   };
 }
 
-function gatedError(repo: string, status: number, mode = "manual"): YtxError {
+/**
+ * A 401 from the hub means one of two things and the response cannot tell them
+ * apart: the repo does not exist, or it is private/gated. Say both, and give
+ * the two concrete next steps rather than asserting a 404 that never happened.
+ */
+function missingRepoError(repo: string, status: number): YtxError {
   return new YtxError({
     what: `model repo ${repo}`,
-    why: `is gated or private (HTTP ${status}, access mode "${mode}")`,
-    next: `accept the model's terms at https://huggingface.co/${repo} and set HF_TOKEN, then retry`,
+    why:
+      status === 404
+        ? "was not found on the hub (HTTP 404)"
+        : "is either not found or private/gated (HTTP 401)",
+    next:
+      status === 404
+        ? "check the owner/repo spelling at https://huggingface.co/models?search=whisper"
+        : "check the owner/repo spelling at https://huggingface.co/models?search=whisper; if the repo is gated, accept its terms and run `huggingface-cli login` (or set HF_TOKEN), then retry",
+    code: EXIT.fetch,
+    kind: "model-repo-missing",
+  });
+}
+
+function gatedError(repo: string, mode = "manual"): YtxError {
+  return new YtxError({
+    what: `model repo ${repo}`,
+    why: `is gated or private (access mode "${mode}")`,
+    next: `accept the model's terms at https://huggingface.co/${repo}, run \`huggingface-cli login\` (or set HF_TOKEN), then retry; other checkpoints are listed at https://huggingface.co/models?search=whisper`,
     code: EXIT.fetch,
     kind: "model-repo-gated",
   });

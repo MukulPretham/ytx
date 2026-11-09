@@ -20,6 +20,8 @@ export const StateSchema = z.object({
     .object({
       version: z.string(),
       channel: z.enum(["stable", "nightly"]),
+      /** "managed" is the runtime copy; "system" is a yt-dlp found on PATH. */
+      source: z.enum(["managed", "system"]).optional(),
       installed_at: z.string(),
       /** Version kept in `bin/yt-dlp.prev` for `update --rollback`. */
       previous_version: z.string().nullable(),

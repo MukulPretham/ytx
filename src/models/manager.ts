@@ -9,6 +9,7 @@
  */
 
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -19,7 +20,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { z } from "zod";
 import { formatZodIssues } from "../core/config.ts";
 import { fetchError, integrityError, YtxError } from "../core/errors.ts";
@@ -28,7 +29,6 @@ import type { RuntimePaths } from "../core/paths.ts";
 import { formatBytes } from "../core/ui.ts";
 import {
   CATALOG,
-  DEFAULT_MODEL_NAME,
   catalogEntryForRepo,
   findCatalogEntry,
   modelDirName,
@@ -124,10 +124,23 @@ export function directorySize(path: string): number {
   return total;
 }
 
-/** The model to transcribe with: state's default, else the catalog default. */
+/** The stored default, or "none" when none has been chosen. */
 export function effectiveDefault(defaultFromState: string | null): string {
   const stored = defaultFromState?.trim();
-  return stored && stored !== "" ? stored : DEFAULT_MODEL_NAME;
+  return stored && stored !== "" ? stored : "none";
+}
+
+/**
+ * The model a transcription will use: an explicit default from state, else the
+ * configured `asr_model`, else "none". `none` means ASR is not configured, and
+ * no command may download weights implicitly to satisfy it.
+ */
+export function configuredModel(defaultFromState: string | null, configModel: string): string {
+  const stored = defaultFromState?.trim();
+  if (stored && stored !== "" && stored !== "none") return stored;
+  const fromConfig = configModel?.trim();
+  if (!fromConfig || fromConfig === "none") return "none";
+  return fromConfig;
 }
 
 export function resolveModelPath(
@@ -155,7 +168,12 @@ export interface AddModelOptions {
   as?: string;
   /** Do not switch the default to this model. */
   keepDefault?: boolean;
+  /** Replace an already-installed model of the same name. */
   force?: boolean;
+  /** Pin a specific revision instead of the catalog/default one. */
+  revision?: string;
+  /** Import this existing model directory instead of downloading. */
+  fromPath?: string;
   onProgress?: (progress: DownloadFileProgress) => void;
   canary?: CanaryRunner;
   /** Called once when an untested repo is about to be downloaded. */
@@ -189,6 +207,10 @@ async function addModelLocked(
   options: AddModelOptions,
 ): Promise<AddModelResult> {
   const trimmed = input.trim();
+  if (options.fromPath) {
+    const name = options.as ?? modelDirName(basename(options.fromPath));
+    return importModelDirectory(runtime, options.fromPath, name, options);
+  }
   if (trimmed === "") {
     throw new YtxError({
       what: "models add",
@@ -216,6 +238,16 @@ async function addModelLocked(
   const staging = stagingDir(runtime, name);
   mkdirSync(runtime.models, { recursive: true });
 
+  if (existsSync(target) && !options.force) {
+    throw new YtxError({
+      what: `model ${name}`,
+      why: `is already installed at ${target}`,
+      next: `use \`ytx models add ${name} --force\` to reinstall it, or \`ytx models verify ${name}\``,
+      code: 2,
+      kind: "model-exists",
+    });
+  }
+
   // Validate against the hub before touching the disk.
   const info = await fetchRepoInfo(repo);
   if (!info.mlx_whisper) {
@@ -237,7 +269,7 @@ async function addModelLocked(
   if (existsSync(staging) && !resumed) rmSync(staging, { recursive: true, force: true });
   mkdirSync(staging, { recursive: true });
 
-  const revision = catalogEntry?.revision ?? info.revision;
+  const revision = options.revision ?? catalogEntry?.revision ?? info.revision;
   const downloadInfo: RepoInfo = { ...info, revision };
 
   try {
@@ -287,6 +319,107 @@ async function addModelLocked(
   } catch (err) {
     // Keep the staging directory: a rerun resumes from the bytes already here.
     // Nothing is installed, because the model directory never appeared.
+    throw err;
+  }
+}
+
+/**
+ * Import a model directory the user already has on disk. This is the offline
+ * path: nothing is downloaded, but the directory still has to look like an MLX
+ * Whisper checkpoint, and it is copied through staging so an interrupted import
+ * leaves no installed model.
+ */
+async function importModelDirectory(
+  runtime: RuntimePaths,
+  source: string,
+  name: string,
+  options: AddModelOptions,
+): Promise<AddModelResult> {
+  if (!existsSync(source) || !statSync(source).isDirectory()) {
+    throw new YtxError({
+      what: `models add --path ${source}`,
+      why: "is not a directory",
+      next: "pass the directory that holds config.json and weights.safetensors",
+      code: 2,
+      kind: "usage",
+    });
+  }
+  const files = readdirSync(source).filter((entry) => !entry.startsWith("."));
+  const hasConfig = files.includes("config.json");
+  const hasWeights = files.some((entry) => /^weights\.(npz|safetensors)$/i.test(entry));
+  if (!hasConfig || !hasWeights) {
+    throw notACheckpointError(`file://${source}`, files);
+  }
+
+  const target = join(runtime.models, modelDirName(name));
+  const staging = stagingDir(runtime, name);
+  mkdirSync(runtime.models, { recursive: true });
+  if (existsSync(target) && !options.force) {
+    throw new YtxError({
+      what: `model ${name}`,
+      why: `is already installed at ${target}`,
+      next: `use \`--force\` to replace it`,
+      code: 2,
+      kind: "model-exists",
+    });
+  }
+
+  rmSync(staging, { recursive: true, force: true });
+  mkdirSync(staging, { recursive: true });
+  try {
+    cpSync(source, staging, { recursive: true });
+    // A source directory may already carry a manifest from a previous install.
+    // It is not a model file: never list it (the new manifest would then be
+    // checked against the old size) and never keep the stale copy.
+    rmSync(join(staging, MANIFEST_FILE), { force: true });
+    const entries = readdirSync(staging, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name !== MANIFEST_FILE)
+      .map((entry) => ({ name: entry.name, size: statSync(join(staging, entry.name)).size }));
+    const total = entries.reduce((sum, file) => sum + file.size, 0);
+
+    let canaryText = "";
+    let canaryPassed = false;
+    if (options.canary) {
+      canaryText = (await options.canary(staging)).trim();
+      canaryPassed = canaryText !== "";
+      if (!canaryPassed) {
+        throw fetchError(
+          `model ${name}`,
+          "the canary transcription produced no text",
+          "the imported directory is incomplete or corrupt",
+        );
+      }
+    }
+
+    const manifest: ModelManifest = {
+      schema: MANIFEST_SCHEMA,
+      name: modelDirName(name),
+      repo: `local:${source}`,
+      revision: "local",
+      catalog: false,
+      files: entries,
+      total_bytes: total,
+      installed_at: new Date().toISOString(),
+      canary: options.canary
+        ? { passed: canaryPassed, text: canaryText.slice(0, 500), at: new Date().toISOString() }
+        : null,
+    };
+    writeFileSync(join(staging, MANIFEST_FILE), JSON.stringify(manifest, null, 2) + "\n", "utf8");
+
+    if (existsSync(target)) {
+      const retired = join(runtime.models, `.old-${modelDirName(name)}-${process.pid}`);
+      rmSync(retired, { recursive: true, force: true });
+      renameSync(target, retired);
+      renameSync(staging, target);
+      rmSync(retired, { recursive: true, force: true });
+    } else {
+      renameSync(staging, target);
+    }
+    return { name: manifest.name, path: target, manifest, catalog: null, resumed: false };
+  } catch (err) {
+    // Keep nothing installed: the staging directory is removed on failure for
+    // imports because there is no resumable download to preserve.
+    rmSync(staging, { recursive: true, force: true });
     throw err;
   }
 }

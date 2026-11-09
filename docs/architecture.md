@@ -1,8 +1,9 @@
 # ytx architecture
 
-Four contracts decide almost everything else here: the directory split, the
-provenance model, the acquisition ladder, and the rule that records are
-validated on every read and write. This note is the single owner of each.
+Five contracts decide almost everything else here: the directory split, the
+provenance model, the acquisition ladder, the no-partial-store rule, and the
+rule that records are validated on every read and write. This note is the single
+owner of each.
 
 ## Two directories, never mixed
 
@@ -67,10 +68,17 @@ filters, `doctor` prints the distribution, and `meta.json` stores it.
 
 Alongside the source, `meta.json` records what makes the transcript reproducible:
 
-- caption sources: `ytdlp_version`
+- caption sources: `ytdlp_version` and `ytdlp_source` (`managed` or `system`)
 - ASR: `model` and `model_revision` (a pinned hub commit)
 
-The field that does not apply is absent, never `null`.
+The field that does not apply is absent, never `null`. `ytdlp_source` is written
+for every new caption record but is optional on read, so a library archived
+before the field existed stays valid.
+
+`meta.json` also carries a `warnings` array: non-fatal observations such as
+"human captions repeat a chorus 65% of the time; repetition is not a rejection
+for human captions". A warning never blocks a record; it is the record's own note
+about why something that looks odd was accepted.
 
 **Raw caption files are immutable; derived transcripts are replaceable.**
 Re-running ASR never deletes a stored caption track, and every rewrite appends
@@ -104,17 +112,23 @@ A caption track is evaluated before it is accepted:
 | coverage | last cue end ÷ video duration ≥ 0.90 |
 | language | detected from the caption body, not the tag |
 | density | ≥ 20 characters per minute of audio |
-| repetition | ≤ 25% duplicate lines |
+| repetition | ≤ 25% duplicate lines, **for `caption-auto` only** |
 
 A rejected track records its reason, and the ladder falls through. The
 repetition gate measures duplicates *after* rolling windows are collapsed, so a
 legitimate rolling track is not punished for the platform's cue format.
 
-Note one honest consequence, observed while validating this build: a music
-video whose human captions repeat a chorus line can exceed 25% duplicate lines
-and be rejected at tier 1, which then sends it to tier 2 or 4. That is the
-specified rule behaving as specified. `--strict-lang` keeps such a video in its
-own language by refusing tier 2.
+The repetition rule is source-aware because human captions legitimately repeat a
+chorus, a chant, or a refrain. Rejecting a music video's human captions at tier 1
+would send it to a worse source for a property that is not a defect:
+
+| source | duplicate lines over 25% |
+| --- | --- |
+| `caption-auto` | rejection; the ladder falls through |
+| `caption-human` | accepted, with a warning recorded in `meta.json` |
+| `asr` | accepted, with a report-only warning |
+
+`--allow-repetitive` bypasses the gate for any source.
 
 ### Normalization
 
@@ -131,6 +145,39 @@ The platform's tracks are not transcripts. Normalization:
 
 A segment's `start` is the first cue it absorbed and its `end` is the last, so no
 timestamp is invented.
+
+## No partial store
+
+A failed `add` must leave the library byte-identical. Two mechanisms enforce it:
+
+1. **Preflight.** Before the library is touched, `add` resolves the downloader
+   and verifies it runs, checks ffmpeg when media will be downloaded, and checks
+   the ASR model and venv when `--asr` forces tier 4. A missing dependency exits
+   `3` without creating even the store skeleton.
+2. **Staging.** Transcript acquisition (caption fetches, ASR audio, transcription)
+   writes only to a scratch directory under the runtime. The video directory is
+   created after a transcript exists. A failed acquisition, a rejected track, or
+   an unconfigured ASR model therefore leaves no meta-less directory behind.
+
+`prune` removes empty directories and directories without `meta.json`; `doctor
+--fix` removes empty ones and regenerates a missing `transcript.txt` from
+`transcript.json`.
+
+ASR audio downloaded into staging is moved into the video directory only when
+media will be archived too, so `--transcript-only` records have no unrecorded
+media files.
+
+## Setup downloads no weights by default
+
+`asr_model` defaults to `"none"`. Weights are installed only by:
+
+- `ytx setup --with-model <name>`
+- answering the wizard's model question with a catalog entry or custom repo
+- `ytx models add <name|repo>`
+
+When a command reaches tier 4 with no model configured, it prints the catalog
+with sizes once and exits `2`; it never downloads implicitly. `doctor` reports
+`asr_model = none` as healthy and still prints the library's provenance mix.
 
 ## Records
 
@@ -155,6 +202,23 @@ If the mp4 mux fails, the separate streams are kept and the failure is reported.
 If the video stream is unavailable, the add degrades to audio-only rather than
 failing: the transcript is the point.
 
+## Downloader resolution and the GitHub fallback
+
+`yt-dlp` is a self-managed standalone binary, but a GitHub outage must not make
+the tool unusable on a machine that already has one. `config.toml` gains
+`ytdlp = "auto" | "managed" | "system"`:
+
+| mode | resolution |
+| --- | --- |
+| `auto` (default) | `bin/yt-dlp` when present, else a `yt-dlp` on `PATH`; setup/update fall back to `PATH` when the managed download fails |
+| `managed` | only `bin/yt-dlp`; a missing binary is an error, never a fallback |
+| `system` | only a `yt-dlp` on `PATH`; setup and update never download |
+
+Every caption record stores which binary fetched it (`ytdlp_source`) and its
+version, and `doctor` prints the resolved source and version. `ytx update --from
+<path>` adopts a specific binary: verify it runs, canary it, promote atomically,
+keep the previous one.
+
 ## Failure handling
 
 yt-dlp exit codes cannot distinguish "gone" from "rate limited" from "too old",
@@ -173,6 +237,16 @@ time; `ytx retry` drains the queue. A transient caption-fetch failure is retried
 twice before it is reported, because silently falling through to local
 transcription would produce a worse transcript for a video whose captions exist.
 
+## Hub validation
+
+A custom model repo is checked against the hub before any bytes are pulled. The
+hub answers `401` both for a repo that does not exist and for a private or gated
+one; the error says both, because asserting "not found" for a `401` would be
+false. A real `404` says not found. Both point at
+`https://huggingface.co/models?search=whisper`, and a gated repo additionally
+points at accepting its terms and `huggingface-cli login` (or `HF_TOKEN`). A
+PyTorch or GGUF checkpoint gets the likely MLX equivalent named.
+
 ## Why each dependency exists
 
 | dependency | why it is here, and why not something else |
@@ -189,19 +263,44 @@ transcription would produce a worse transcript for a video whose captions exist.
 ## Command surface
 
 `init`, `setup`, `update`, `doctor`, `add`, `transcript`, `show`, `list`,
-`search`, `retry`, `rm`, `prune`, `models`, and `sync` (a stub in v1).
+`search`, `retry`, `rm`, `prune`, `models`, and `sync` (which exits `2` and says
+it is not implemented in v1).
+
+Notable flag surface:
+
+```
+add        --max-height --language --quality auto|best --asr --no-asr
+           --strict-lang --allow-repetitive --parallel --cookies-from-browser
+           --force --no-media|--transcript-only
+transcript <url|id> --format txt|json|srt|vtt|md --timestamps --language --asr
+show       <id> --format --timestamps --raw --history
+list       --source --missing-transcript --missing-media --sort --limit
+search     <query> --source --transcripts --limit --context --id
+retry      --all --limit --max-attempts --dry-run
+rm         <id...> --yes
+prune      --dry-run --yes
+doctor     --fix --json
+update     --check --rollback --nightly --force --all --from <path>
+models     list | add <name|repo> | rm | verify | default | path
+           add: --as --no-default --force --revision --path
+           verify: --deep
+setup      --language --with-model --browser --force
+```
 
 Every command supports `--json`. Exit codes are `0` ok, `2` usage, `3` fetch or
 dependency failure, `4` no transcript obtainable, `5` quality gate failed, `6`
 store integrity error, `130` interrupted.
 
+`ytx transcript <url>` fetches and prints without writing; `ytx transcript <id>`
+reads the store. `ytx add --force` is the way to replace an archived transcript.
+
 ## Testing
 
 `bun test` covers the pure logic only, with no network: caption parsing and
-normalization (including rolling-window collapse), the quality gates, path
-resolution and URL parsing, language detection, ladder planning, record schema
-and transcript validation, config round-trips, failure classification, queue
-backoff, the model catalog, and manifest validation.
+normalization (including rolling-window collapse), the source-aware quality
+gates, path resolution and URL parsing, language detection, ladder planning,
+record schema and transcript validation, config round-trips, failure
+classification, queue backoff, the model catalog, and manifest validation.
 
 Everything that touches the network or a Python process is verified by hand
 against live videos; that evidence lives in the task record, not in `bun test`.

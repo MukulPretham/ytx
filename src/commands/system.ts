@@ -5,21 +5,22 @@
  * and only fills the gaps, and a component is either fully installed or absent.
  */
 
-import { chmodSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_CANARY_URLS, defaultConfig, saveConfig } from "../core/config.ts";
-import { EXIT, asYtxError, fetchError, YtxError } from "../core/errors.ts";
-import { readAllMeta } from "../core/record.ts";
+import { EXIT, asYtxError, fetchError, usageError, YtxError } from "../core/errors.ts";
+import { TRANSCRIPT_JSON, TRANSCRIPT_TXT, listVideoIds, readAllMeta, readTranscript, renderTranscriptText } from "../core/record.ts";
 import { videoDir } from "../core/paths.ts";
+import { isProcessAlive, readLock } from "../core/lock.ts";
 import { saveState } from "../core/state.ts";
 import { columns, formatBytes } from "../core/ui.ts";
 import type { CommandContext, GlobalFlags } from "./context.ts";
 import { failAfterEmit, resolveFfmpegPath } from "./context.ts";
-import { effectiveDefault, listInstalled, verifyModel } from "../models/manager.ts";
+import { configuredModel, listInstalled, verifyModel } from "../models/manager.ts";
 import { modelDirName } from "../models/catalog.ts";
 import { ensureVenv, findUv, installUv, uvVersionSync, venvStatus } from "../asr/venv.ts";
 import { installYtdlp, rollbackYtdlp, ytdlpVersion } from "../ytdlp/binary.ts";
-import { fetchInfo } from "../ytdlp/run.ts";
+import { fetchInfo, readVersion } from "../ytdlp/run.ts";
 import { provenanceCounts } from "./render.ts";
 import { runWizard, wizardDefaults, type WizardChoices } from "../wizard.ts";
 import { addModel } from "../models/manager.ts";
@@ -30,6 +31,9 @@ import { acquireLock } from "../core/lock.ts";
 
 export interface SetupFlags {
   language?: string;
+  /** `--with-model <name>`: the only way setup downloads weights non-interactively. */
+  withModel?: string;
+  /** Deprecated alias for --with-model, kept so old scripts keep working. */
   model?: string;
   browser?: string;
   force: boolean;
@@ -40,16 +44,26 @@ export async function cmdSetup(
   flags: SetupFlags,
   global: GlobalFlags,
 ): Promise<void> {
-  const interactive = Boolean(process.stdin.isTTY) && !global.yes && !global.nonInteractive;
+  // `--json` implies non-interactive: prompts would corrupt the single JSON
+  // document a machine consumer expects on stdout.
+  const interactive =
+    Boolean(process.stdin.isTTY) && !global.yes && !global.nonInteractive && !global.json;
   const choices: WizardChoices = interactive
     ? await runWizard({ context, defaults: wizardDefaults(context) })
-    : wizardDefaults(context, flags);
+    : wizardDefaults(context, { ...flags, model: flags.withModel ?? flags.model });
 
-  if (!interactive && (flags.language || flags.model || flags.browser)) {
+  if (!interactive && (flags.language || flags.withModel || flags.model || flags.browser)) {
     context.ui.note("using the flags you passed; no prompt was shown");
   }
 
   const report = await applySetup(context, choices, flags.force);
+
+  const modelState = choices.model === "none" ? "none (captions only)" : choices.model;
+  const ytdlpStep = report.steps.find((step) => step.name === "yt-dlp");
+  context.ui.line("");
+  context.ui.line(
+    `setup ${report.ok ? "complete" : "incomplete"}: yt-dlp ${ytdlpStep?.detail ?? "unknown"} · ffmpeg ${report.steps.find((step) => step.name === "ffmpeg")?.detail ?? "unknown"} · model ${modelState} · library ${choices.library}`,
+  );
 
   context.ui.emit({ choices: report.choices, steps: report.steps, doctor: report.doctor });
   if (!report.ok) {
@@ -106,28 +120,74 @@ export async function applySetup(
   context.config = config;
   steps.push({ name: "config", status: "present", detail: context.library.config });
 
-  // yt-dlp: always owned by ytx, in the runtime directory.
+  // yt-dlp: managed in the runtime directory, or a PATH binary, per config.
+  const ytdlpMode = config.ytdlp;
   try {
     const existing = await ytdlpVersion(context.runtime.ytdlp);
-    if (existing !== null && !force) {
-      steps.push({ name: "yt-dlp", status: "present", detail: existing });
-      ui.ok(`yt-dlp ${existing} already installed`);
+    const onPath = Bun.which("yt-dlp");
+    const pathVersion = onPath ? await ytdlpVersion(onPath) : null;
+
+    if (ytdlpMode === "system") {
+      if (pathVersion === null) {
+        throw fetchError(
+          "yt-dlp",
+          'no yt-dlp was found on PATH, and config.toml sets ytdlp = "system"',
+          "install yt-dlp yourself, or set `ytdlp = \"auto\"` and rerun `ytx setup`",
+        );
+      }
+      context.state.ytdlp = {
+        version: pathVersion,
+        channel: config.ytdlp_channel,
+        source: "system",
+        installed_at: new Date().toISOString(),
+        previous_version: null,
+      };
+      steps.push({ name: "yt-dlp", status: "present", detail: `${pathVersion} (system, ${onPath})` });
+      ui.ok(`yt-dlp ${pathVersion} (system: ${onPath})`);
+    } else if (existing !== null && !force) {
+      context.state.ytdlp = {
+        ...(context.state.ytdlp ?? { channel: config.ytdlp_channel, installed_at: new Date().toISOString(), previous_version: null }),
+        version: existing,
+        source: "managed",
+      };
+      steps.push({ name: "yt-dlp", status: "present", detail: `${existing} (managed)` });
+      ui.ok(`yt-dlp ${existing} already installed (managed)`);
     } else {
       ui.note("installing yt-dlp…");
-      const result = await installYtdlp(context.runtime, config.ytdlp_channel, {
-        onProgress: (progress) => {
-          ui.progress("  yt-dlp", progress.total ? progress.received / progress.total : null);
-        },
-      });
-      ui.progressDone();
-      context.state.ytdlp = {
-        version: result.version,
-        channel: config.ytdlp_channel,
-        installed_at: new Date().toISOString(),
-        previous_version: result.previous,
-      };
-      steps.push({ name: "yt-dlp", status: "installed", detail: result.version });
-      ui.ok(`installed yt-dlp ${result.version}`);
+      try {
+        const result = await installYtdlp(context.runtime, config.ytdlp_channel, {
+          onProgress: (progress) => {
+            ui.progress("  yt-dlp", progress.total ? progress.received / progress.total : null);
+          },
+        });
+        ui.progressDone();
+        context.state.ytdlp = {
+          version: result.version,
+          channel: config.ytdlp_channel,
+          source: "managed",
+          installed_at: new Date().toISOString(),
+          previous_version: result.previous,
+        };
+        steps.push({ name: "yt-dlp", status: "installed", detail: `${result.version} (managed)` });
+        ui.ok(`installed yt-dlp ${result.version} (managed)`);
+      } catch (err) {
+        ui.progressDone();
+        if (ytdlpMode === "auto" && pathVersion !== null) {
+          // A7: GitHub being down must not make the whole tool unusable when a
+          // usable yt-dlp is already on PATH.
+          context.state.ytdlp = {
+            version: pathVersion,
+            channel: config.ytdlp_channel,
+            source: "system",
+            installed_at: new Date().toISOString(),
+            previous_version: null,
+          };
+          steps.push({ name: "yt-dlp", status: "present", detail: `${pathVersion} (system fallback: ${onPath})` });
+          ui.warn(`the managed download failed (${(err as Error).message}); using yt-dlp ${pathVersion} on PATH`);
+        } else {
+          throw err;
+        }
+      }
     }
   } catch (err) {
     const error = asYtxError(err, "install yt-dlp", "check the network and rerun `ytx setup`");
@@ -184,6 +244,7 @@ export async function applySetup(
       try {
         ui.note(`installing model ${choices.model}…`);
         const added = await addModel(context.runtime, choices.model, {
+          force,
           onUntested: (repo) =>
             ui.warn(`${repo} is not in the tested catalog; it will be canaried, but quality is unverified`),
           onProgress: (progress) => {
@@ -353,6 +414,8 @@ export interface UpdateFlags {
   force: boolean;
   all: boolean;
   rollback: boolean;
+  /** `--from <path>`: adopt a specific binary into the runtime directory. */
+  from?: string;
 }
 
 export async function cmdUpdate(context: CommandContext, flags: UpdateFlags): Promise<void> {
@@ -374,11 +437,38 @@ export async function cmdUpdate(context: CommandContext, flags: UpdateFlags): Pr
   if (flags.check) {
     const latest = await latestVersion(channel);
     const outdated = installed !== latest;
-    context.ui.line(`installed  ${installed ?? "none"}`);
+    const resolved =
+      context.downloader.available === false ? null : await readVersion(context.downloader.binary);
+    context.ui.line(`installed  ${installed ?? "none"} (managed)`);
+    context.ui.line(
+      `resolved   ${resolved ?? "none"} (${context.downloader.source}: ${context.downloader.available === false ? "not available" : context.downloader.binary})`,
+    );
     context.ui.line(`latest     ${latest ?? "unknown"} (${channel})`);
     context.ui.line(outdated ? "status     an update is available" : "status     up to date");
-    context.ui.emit({ action: "check", channel, installed, latest, outdated });
+    context.ui.emit({
+      action: "check",
+      channel,
+      installed,
+      resolved,
+      source: context.downloader.source,
+      binary: context.downloader.binary,
+      latest,
+      outdated,
+    });
     return;
+  }
+
+  if (flags.from) {
+    await adoptBinary(context, flags.from, channel, flags.force);
+    return;
+  }
+
+  if (context.config.ytdlp === "system") {
+    throw usageError(
+      "update",
+      'config.toml sets ytdlp = "system", so ytx never downloads a binary',
+      "update yt-dlp with your system package manager, or adopt a binary with `ytx update --from <path>`",
+    );
   }
 
   const canaryUrls = context.config.canary_urls.length > 0 ? context.config.canary_urls : [...DEFAULT_CANARY_URLS];
@@ -395,7 +485,7 @@ export async function cmdUpdate(context: CommandContext, flags: UpdateFlags): Pr
             context.ui.note(`canarying yt-dlp ${version} against ${canaryUrls.length} reference video(s)…`);
             for (const url of canaryUrls) {
               try {
-                const info = await fetchInfo(url, { binary: staged });
+                const info = await fetchInfo(url, { binary: staged, source: "managed" });
                 if (!info.info.id) throw new Error("no video id in the metadata response");
                 context.ui.note(`  ✓ ${url}`);
               } catch (err) {
@@ -451,8 +541,121 @@ export async function cmdUpdate(context: CommandContext, flags: UpdateFlags): Pr
         kind: "canary-failed",
       });
     }
+    // A7: auto mode keeps working through a GitHub outage when PATH has a
+    // usable yt-dlp; the failed download is reported, not hidden.
+    if (context.config.ytdlp === "auto") {
+      const onPath = Bun.which("yt-dlp");
+      const pathVersion = onPath ? await ytdlpVersion(onPath) : null;
+      if (pathVersion !== null) {
+        context.ui.warn(`the managed update failed (${error.why}); still using yt-dlp ${pathVersion} on PATH`);
+        context.state.ytdlp = {
+          version: pathVersion,
+          channel,
+          source: "system",
+          installed_at: new Date().toISOString(),
+          previous_version: context.state.ytdlp?.previous_version ?? null,
+        };
+        saveState(context.runtime.state, context.state);
+        context.ui.emit({
+          action: "update",
+          channel,
+          from: installed,
+          to: pathVersion,
+          source: "system",
+          fell_back_to_system: true,
+          previous: context.state.ytdlp?.previous_version ?? null,
+          venv_refreshed: false,
+        });
+        return;
+      }
+    }
     throw error;
   } finally {
+    lock.release();
+  }
+}
+
+/** Adopt a binary the user already has: verify, canary, promote atomically. */
+async function adoptBinary(
+  context: CommandContext,
+  source: string,
+  channel: "stable" | "nightly",
+  force: boolean,
+): Promise<void> {
+  if (!existsSync(source) || !statSync(source).isFile()) {
+    throw usageError(
+      `update --from ${source}`,
+      "is not a file",
+      "pass the path to an executable yt-dlp binary",
+    );
+  }
+  const lock = acquireLock(context.runtime.locks, "ytdlp", "ytx update --from");
+  mkdirSync(context.runtime.bin, { recursive: true });
+  mkdirSync(context.runtime.tmp, { recursive: true });
+  const staged = join(context.runtime.tmp, `yt-dlp-adopted-${process.pid}`);
+  try {
+    copyFileSync(source, staged);
+    chmodSync(staged, 0o755);
+    const version = await ytdlpVersion(staged);
+    if (version === null) {
+      throw fetchError(
+        `yt-dlp --from ${source}`,
+        "does not run on this machine",
+        "pass an executable yt-dlp build for this platform",
+      );
+    }
+
+    const canaryUrls =
+      context.config.canary_urls.length > 0 ? context.config.canary_urls : [...DEFAULT_CANARY_URLS];
+    if (!force) {
+      context.ui.note(`canarying the adopted binary against ${canaryUrls.length} reference video(s)…`);
+      for (const url of canaryUrls) {
+        try {
+          await fetchInfo(url, { binary: staged, source: "managed" });
+          context.ui.note(`  ✓ ${url}`);
+        } catch (err) {
+          throw new YtxError({
+            what: "yt-dlp canary",
+            why: `${url} failed: ${(err as Error).message}`,
+            next: "the working binary was kept; retry, or pass `--force` to skip the canary",
+            code: EXIT.fetch,
+            kind: "canary-failed",
+          });
+        }
+      }
+    }
+
+    const previous = await ytdlpVersion(context.runtime.ytdlp);
+    if (existsSync(context.runtime.ytdlp)) {
+      rmSync(context.runtime.ytdlpPrev, { force: true });
+      renameSync(context.runtime.ytdlp, context.runtime.ytdlpPrev);
+    }
+    renameSync(staged, context.runtime.ytdlp);
+    chmodSync(context.runtime.ytdlp, 0o755);
+
+    context.state.ytdlp = {
+      version,
+      channel,
+      source: "managed",
+      installed_at: new Date().toISOString(),
+      previous_version: previous,
+    };
+    saveState(context.runtime.state, context.state);
+
+    context.ui.ok(`adopted yt-dlp ${version} from ${source}`);
+    if (previous) context.ui.line(`  previous ${previous} kept at bin/yt-dlp.prev`);
+    context.ui.emit({
+      action: "update",
+      channel,
+      from: previous,
+      to: version,
+      source: "managed",
+      adopted_from: source,
+      previous,
+      venv_refreshed: false,
+    });
+  } finally {
+    rmSync(staged, { force: true });
     lock.release();
   }
 }
@@ -491,6 +694,85 @@ export interface DoctorReport {
   provenance: Record<string, number>;
   queue: number;
   models: { name: string; default: boolean; ok: boolean; detail: string }[];
+  /** Actions taken by `doctor --fix`, when it was asked to repair. */
+  fixed?: string[];
+}
+
+/**
+ * `doctor --fix` repairs only things whose repair cannot lose data: missing
+ * directories and files that can be regenerated, stale locks, and empty
+ * directories. It never deletes a record or a media file.
+ */
+function applyDoctorFixes(context: CommandContext): string[] {
+  const fixed: string[] = [];
+
+  if (!existsSync(context.library.videos)) {
+    mkdirSync(context.library.videos, { recursive: true });
+    fixed.push(`created ${context.library.videos}`);
+  }
+  if (!existsSync(context.library.config)) {
+    saveConfig(context.library, defaultConfig());
+    fixed.push(`wrote ${context.library.config}`);
+  }
+  if (!existsSync(context.library.queue)) {
+    writeFileSync(context.library.queue, "", "utf8");
+    fixed.push(`created ${context.library.queue}`);
+  }
+
+  for (const id of listVideoIds(context.library)) {
+    const dir = videoDir(context.library, id);
+    if (existsSync(join(dir, "meta.json"))) continue;
+    if (directorySize(dir) === 0) {
+      rmSync(dir, { recursive: true, force: true });
+      fixed.push(`removed empty directory ${dir}`);
+    }
+  }
+
+  const { records } = readAllMeta(context.library);
+  for (const record of records) {
+    const dir = videoDir(context.library, record.id);
+    const json = join(dir, TRANSCRIPT_JSON);
+    const txt = join(dir, TRANSCRIPT_TXT);
+    if (existsSync(json) && !existsSync(txt)) {
+      try {
+        writeFileSync(txt, renderTranscriptText(readTranscript(context.library, record.id)), "utf8");
+        fixed.push(`regenerated ${txt}`);
+      } catch {
+        // A corrupt transcript.json is reported by doctor, not repaired here.
+      }
+    }
+  }
+
+  if (existsSync(context.runtime.locks)) {
+    for (const name of readdirSync(context.runtime.locks)) {
+      if (!name.endsWith(".lock")) continue;
+      const path = join(context.runtime.locks, name);
+      const info = readLock(path);
+      if (info && !isProcessAlive(info.pid)) {
+        rmSync(path, { force: true });
+        fixed.push(`removed stale lock ${name}`);
+      }
+    }
+  }
+
+  return fixed;
+}
+
+function directorySize(path: string): number {
+  let total = 0;
+  try {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const child = join(path, entry.name);
+      try {
+        total += entry.isDirectory() ? directorySize(child) : statSync(child).size;
+      } catch {
+        // A file may vanish mid-scan.
+      }
+    }
+  } catch {
+    return 0;
+  }
+  return total;
 }
 
 export async function doctorReport(context: CommandContext): Promise<DoctorReport> {
@@ -498,15 +780,27 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
   const push = (group: string, name: string, ok: boolean, detail: string, fix: string | null = null) => {
     checks.push({ group, name, ok, detail, fix });
   };
+  const wantedModel = configuredModel(context.state.default_model, context.config.asr_model);
 
-  // Dependencies
-  const version = await ytdlpVersion(context.runtime.ytdlp);
+  // Dependencies. The downloader is reported as resolved, not just installed:
+  // the source decides whether `ytx update` can replace it.
+  const resolvedVersion =
+    context.downloader.available === false ? null : await readVersion(context.downloader.binary);
+  const ytdlpSource = context.downloader.source;
   push(
     "dependencies",
     "yt-dlp",
-    version !== null,
-    version ? `${version} (${context.runtime.ytdlp})` : "not installed",
-    version ? null : "run `ytx setup`",
+    resolvedVersion !== null,
+    resolvedVersion
+      ? `${resolvedVersion} (${ytdlpSource}: ${context.downloader.binary})`
+      : context.downloader.available === false
+        ? `not installed (config ytdlp = ${context.config.ytdlp}; no binary is available)`
+        : `not installed (config ytdlp = ${context.config.ytdlp})`,
+    resolvedVersion
+      ? null
+      : context.config.ytdlp === "system"
+        ? "install yt-dlp on PATH, or set `ytdlp = \"auto\"` and run `ytx setup`"
+        : "run `ytx setup`",
   );
 
   const ffmpegPath = resolveFfmpegPath(context.runtime);
@@ -520,21 +814,27 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
   );
 
   const uv = findUv(context.runtime);
+  const uvNeeded = wantedModel !== "none";
   push(
     "dependencies",
     "uv",
-    uv !== null,
-    uvVersionSync(uv) ?? (uv ? uv : "not installed"),
-    uv ? null : "run `ytx setup`",
+    uv !== null || !uvNeeded,
+    uvVersionSync(uv) ?? (uv ? uv : uvNeeded ? "not installed" : "not needed (asr_model = none)"),
+    uv || !uvNeeded ? null : "run `ytx setup`",
   );
 
   const venv = await venvStatus(context.runtime);
+  const venvNeeded = wantedModel !== "none";
   push(
     "dependencies",
     "mlx-whisper venv",
-    venv.ready,
-    venv.ready ? `${venv.mlx_whisper} (${venv.python})` : (venv.reason ?? "not ready"),
-    venv.ready ? null : "run `ytx setup`, or `ytx update --all` to rebuild it",
+    venv.ready || !venvNeeded,
+    venv.ready
+      ? `${venv.mlx_whisper} (${venv.python})`
+      : venvNeeded
+        ? (venv.reason ?? "not ready")
+        : "not needed (asr_model = none)",
+    venv.ready || !venvNeeded ? null : "run `ytx setup`, or `ytx update --all` to rebuild it",
   );
 
   // Config
@@ -546,7 +846,7 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
 
   // Models
   const installed = listInstalled(context.runtime);
-  const defaultName = effectiveDefault(context.state.default_model);
+  const defaultName = wantedModel;
   const modelRows: DoctorReport["models"] = [];
   for (const model of installed) {
     const verification = verifyModel(context.runtime, model.name);
@@ -568,20 +868,23 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
     );
   }
   if (installed.length === 0) {
+    const asrConfigured = context.config.asr_model !== "none";
     push(
       "models",
       "installed models",
-      context.config.asr_model === "none",
-      context.config.asr_model === "none" ? "none needed (asr_model = none)" : "none installed",
-      context.config.asr_model === "none" ? null : "run `ytx models add turbo`",
+      !asrConfigured,
+      asrConfigured ? `none installed, but asr_model = ${context.config.asr_model}` : "none needed (asr_model = none)",
+      asrConfigured ? "run `ytx models add <name>`, or set `asr_model = \"none\"`" : null,
     );
-  } else if (!installed.some((model) => model.name === modelDirName(defaultName))) {
+  } else if (wantedModel === "none") {
+    push("models", "default model", true, "none selected (asr_model = none)");
+  } else if (!installed.some((model) => model.name === modelDirName(wantedModel))) {
     push(
       "models",
       "default model",
       false,
-      `${defaultName} is not installed`,
-      `run \`ytx models add ${defaultName}\`, or \`ytx models default <installed name>\``,
+      `${wantedModel} is not installed`,
+      `run \`ytx models add ${wantedModel}\`, or \`ytx models default <installed name>\``,
     );
   }
 
@@ -679,8 +982,14 @@ export function printDoctor(context: CommandContext, report: DoctorReport): void
   }
 }
 
-export async function cmdDoctor(context: CommandContext): Promise<void> {
+export async function cmdDoctor(context: CommandContext, flags: { fix: boolean } = { fix: false }): Promise<void> {
+  const fixed = flags.fix ? applyDoctorFixes(context) : [];
+  if (fixed.length > 0 && !context.flags.json) {
+    for (const action of fixed) context.ui.ok(`fixed: ${action}`);
+    context.ui.line("");
+  }
   const report = await doctorReport(context);
+  if (fixed.length > 0) report.fixed = fixed;
   if (!context.flags.json) printDoctor(context, report);
 
   // Broken records and missing media files are both store integrity problems.

@@ -12,10 +12,10 @@ import { saveState } from "../core/state.ts";
 import { columns, formatAge, formatBytes } from "../core/ui.ts";
 import type { CommandContext } from "./context.ts";
 import { failAfterEmit } from "./context.ts";
-import { CATALOG, DEFAULT_MODEL_NAME, findCatalogEntry } from "../models/catalog.ts";
+import { CATALOG, DEFAULT_MODEL_NAME, findCatalogEntry, modelDirName } from "../models/catalog.ts";
 import {
   addModel,
-  effectiveDefault,
+  configuredModel,
   formatModelSummary,
   listInstalled,
   modelDir,
@@ -33,6 +33,14 @@ export interface ModelsFlags {
   noDefault: boolean;
   yes: boolean;
   canary: boolean;
+  /** Pin a specific hub revision instead of the catalog/default one. */
+  revision?: string;
+  /** Import an existing model directory instead of downloading. */
+  path?: string;
+  /** Replace an installed model of the same name. */
+  force: boolean;
+  /** `verify --deep`: verify files and run the canary transcription. */
+  deep: boolean;
 }
 
 export async function cmdModels(
@@ -66,7 +74,7 @@ export async function cmdModels(
 
 function list(context: CommandContext): void {
   const installed = listInstalled(context.runtime);
-  const defaultName = effectiveDefault(context.state.default_model);
+  const defaultName = configuredModel(context.state.default_model, context.config.asr_model);
   const rows: string[][] = [];
 
   if (!context.flags.json) {
@@ -121,26 +129,31 @@ async function add(
   positionals: string[],
   flags: ModelsFlags,
 ): Promise<void> {
-  const input = positionals[0];
-  if (!input) {
+  const input = positionals[0] ?? "";
+  if (!input && !flags.path) {
     throw usageError(
       "models add",
-      "needs a model name or a hub repo",
-      `use one of ${CATALOG.map((entry) => entry.name).join(", ")}, or \`owner/repo\``,
+      "needs a model name, a hub repo, or --path <dir>",
+      `use one of ${CATALOG.map((entry) => entry.name).join(", ")}, \`owner/repo\`, or \`--path <dir>\``,
     );
   }
 
   requireFfmpeg(context);
   const isCatalog = Boolean(findCatalogEntry(input));
-  const nameHint = flags.as ?? findCatalogEntry(input)?.name ?? input;
+  const nameHint = flags.as ?? findCatalogEntry(input)?.name ?? (flags.path ? modelDirName(input || "imported-model") : input);
 
   if (!context.flags.json) {
-    context.ui.note(`checking ${input} on the hub…`);
+    context.ui.note(
+      flags.path ? `importing ${flags.path}…` : `checking ${input} on the hub…`,
+    );
   }
 
   const result = await addModel(context.runtime, input, {
     as: flags.as,
     keepDefault: flags.noDefault,
+    force: flags.force,
+    revision: flags.revision,
+    fromPath: flags.path,
     onUntested: (repo) => {
       context.ui.warn(
         `${repo} is not in the tested catalog; it will be downloaded and canaried, but quality is unverified`,
@@ -174,7 +187,7 @@ async function add(
   if (!flags.noDefault && (currentDefault === null || currentDefault === result.name || isCatalog)) {
     context.state.default_model = result.name;
     saveState(context.runtime.state, context.state);
-    isDefault = effectiveDefault(context.state.default_model) === result.name;
+    isDefault = configuredModel(context.state.default_model, context.config.asr_model) === result.name;
   }
 
   if (!context.flags.json) {
@@ -205,7 +218,7 @@ function remove(context: CommandContext, positionals: string[], flags: ModelsFla
     throw usageError("models rm", "needs a model name", "run `ytx models list` to see installed models");
   }
 
-  const defaultName = effectiveDefault(context.state.default_model);
+  const defaultName = configuredModel(context.state.default_model, context.config.asr_model);
   if (!flags.yes && !context.flags.nonInteractive && process.stdin.isTTY) {
     const answer = prompt(`Remove model ${name}? [y/N]`);
     if (!answer || !/^y(es)?$/i.test(answer.trim())) {
@@ -252,7 +265,7 @@ async function verify(
   for (const name of targets) {
     const result = verifyModel(context.runtime, name);
     let canaryText: string | null = null;
-    if (flags.canary && result.ok) {
+    if ((flags.canary || flags.deep) && result.ok) {
       requireFfmpeg(context);
       const manifest = listInstalled(context.runtime).find((entry) => entry.name === name)?.manifest ?? null;
       try {
@@ -302,7 +315,7 @@ async function verify(
 
 function setDefault(context: CommandContext, positionals: string[]): void {
   const name = positionals[0];
-  const current = effectiveDefault(context.state.default_model);
+  const current = configuredModel(context.state.default_model, context.config.asr_model);
 
   if (!name) {
     context.ui.line(current);
@@ -332,7 +345,7 @@ function showPath(context: CommandContext, positionals: string[]): void {
   const name = positionals[0];
   if (!name) {
     context.ui.line(modelsRoot(context.runtime));
-    context.ui.emit({ path: modelsRoot(context.runtime), default: effectiveDefault(context.state.default_model) });
+    context.ui.emit({ path: modelsRoot(context.runtime), default: configuredModel(context.state.default_model, context.config.asr_model) });
     return;
   }
   const resolved = resolveModelPath(context.runtime, name);
@@ -341,7 +354,8 @@ function showPath(context: CommandContext, positionals: string[]): void {
     path: resolved.path,
     name: resolved.name,
     manifest: resolved.manifest,
-    default: resolved.name === effectiveDefault(context.state.default_model),
+    default:
+      resolved.name === configuredModel(context.state.default_model, context.config.asr_model),
   });
 }
 

@@ -156,18 +156,25 @@ function dedupeExactCues(cues: readonly Cue[]): Cue[] {
 }
 
 function duplicateRatio(cues: readonly Cue[]): number {
+  return duplicateLineRatioOf(cues.flatMap((cue) => cue.text.split("\n")));
+}
+
+/**
+ * Fraction of lines that repeat an earlier line, after stripping punctuation
+ * and case. Shared by the caption gates and the ASR warning so both measure
+ * the same thing.
+ */
+export function duplicateLineRatioOf(lines: readonly string[]): number {
   const counts = new Map<string, number>();
   let total = 0;
-  for (const cue of cues) {
-    for (const line of cue.text.split("\n")) {
-      const key = line
-        .toLowerCase()
-        .replace(/[^\p{L}\p{N}]+/gu, "")
-        .trim();
-      if (key === "") continue;
-      total += 1;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
+  for (const line of lines) {
+    const key = line
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, "")
+      .trim();
+    if (key === "") continue;
+    total += 1;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   if (total === 0) return 0;
   let duplicates = 0;

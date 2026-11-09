@@ -2,13 +2,23 @@
  * Library commands: init, add, transcript, show, list, search, retry, rm, prune.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, join } from "node:path";
 import { defaultConfig, saveConfig } from "../core/config.ts";
-import { EXIT, asYtxError, usageError, YtxError } from "../core/errors.ts";
+import { EXIT, asYtxError, fetchError, usageError, YtxError } from "../core/errors.ts";
 import { canonicalWatchUrl, parseVideoUrl, videoDir } from "../core/paths.ts";
 import {
   META_FILE,
+  TRANSCRIPT_JSON,
   TRANSCRIPT_TXT,
   listVideoIds,
   readAllMeta,
@@ -30,12 +40,30 @@ import {
 import { dueEntries, enqueue, readQueue, removeFromQueue, scheduleEntry } from "../core/queue.ts";
 import { saveState } from "../core/state.ts";
 import { columns, formatBytes, formatDuration } from "../core/ui.ts";
-import { chapterLines, formatClock, mediaLine, provenanceLine, snippet } from "./render.ts";
+import {
+  TRANSCRIPT_FORMATS,
+  chapterLines,
+  formatClock,
+  mediaLine,
+  provenanceLine,
+  renderTranscript,
+  snippet,
+  type TranscriptFormat,
+} from "./render.ts";
 import { acquireTranscript, acquisitionOptions } from "./acquisition.ts";
 import type { CommandContext } from "./context.ts";
-import { ensureLibrary, failAfterEmit, requireFfmpeg } from "./context.ts";
-import { downloadMedia, fetchInfo, type YtdlpRawInfo } from "../ytdlp/run.ts";
+import { ensureLibrary, failAfterEmit, requireDownloader, requireFfmpeg } from "./context.ts";
+import {
+  downloadAudioStream,
+  downloadMedia,
+  fetchInfo,
+  findExistingAudio,
+  type YtdlpRawInfo,
+} from "../ytdlp/run.ts";
 import { acquireLock } from "../core/lock.ts";
+import { catalogChoices } from "../models/catalog.ts";
+import { configuredModel, resolveModelPath } from "../models/manager.ts";
+import { findUv } from "../asr/venv.ts";
 
 /** Acquisition flags shared by `add`, `transcript` and `retry`. */
 export interface QuestionFlags {
@@ -44,6 +72,8 @@ export interface QuestionFlags {
   asr: boolean;
   noAsr: boolean;
   strictLang: boolean;
+  /** `--allow-repetitive`: bypass the repetition gate for any source. */
+  allowRepetitive: boolean;
 }
 
 export interface AddFlags extends QuestionFlags {
@@ -52,6 +82,42 @@ export interface AddFlags extends QuestionFlags {
   browser: string | null;
   parallel: number;
   noMedia: boolean;
+}
+
+export interface TranscriptFlags extends QuestionFlags {
+  format: TranscriptFormat;
+  timestamps: boolean;
+}
+
+export interface ShowFlags {
+  raw: boolean;
+  timestamps: boolean;
+  history: boolean;
+  format: TranscriptFormat;
+}
+
+export interface ListFlags {
+  source?: string;
+  sort?: string;
+  limit?: number;
+  missingTranscript: boolean;
+  missingMedia: boolean;
+}
+
+export interface SearchFlags {
+  source?: string;
+  limit: number;
+  context: number;
+  ids?: string[];
+  transcriptsOnly: boolean;
+}
+
+export interface RetryFlags {
+  all: boolean;
+  limit: number;
+  /** Drop an entry once it has failed this many times. null means no cap. */
+  maxAttempts: number | null;
+  dryRun: boolean;
 }
 
 export async function cmdInit(context: CommandContext, positionals: string[]): Promise<void> {
@@ -78,6 +144,40 @@ export async function cmdInit(context: CommandContext, positionals: string[]): P
   });
 }
 
+/**
+ * Everything `add` will need, checked before the first byte is written to the
+ * library. A dependency failure therefore leaves the store byte-identical.
+ */
+async function preflightAdd(context: CommandContext, flags: AddFlags): Promise<void> {
+  await requireDownloader(context);
+  if (!flags.noMedia) requireFfmpeg(context);
+  // Tier 4 is only certain under `--asr`; without it, captions may satisfy the
+  // ladder and the model is not needed. The staging directory still protects
+  // the store when a fallback to ASR fails.
+  if (flags.asr) await requireAsrReady(context);
+}
+
+/** Fail with the model choices, not a download, when ASR cannot run. */
+async function requireAsrReady(context: CommandContext): Promise<void> {
+  const name = configuredModel(context.state.default_model, context.config.asr_model);
+  if (name === "none") {
+    throw usageError(
+      "transcription",
+      'no local model is configured (asr_model = "none")',
+      `choose one with \`ytx models add <name>\` (${catalogChoices()}), then \`ytx models default <name>\``,
+    );
+  }
+  resolveModelPath(context.runtime, name);
+  requireFfmpeg(context);
+  if (findUv(context.runtime) === null) {
+    throw fetchError(
+      "transcription environment",
+      "uv is not installed, so the mlx-whisper venv cannot be created",
+      "run `ytx setup` to install it",
+    );
+  }
+}
+
 export async function cmdAdd(
   context: CommandContext,
   positionals: string[],
@@ -91,11 +191,6 @@ export async function cmdAdd(
     );
   }
 
-  ensureLibrary(context);
-  context.config.max_height = flags.maxHeight;
-  const acquired: string[] = [];
-  const failures: YtxError[] = [];
-
   const targets = positionals.map((input) => {
     const parsed = parseVideoUrl(input);
     if (parsed.id === null) {
@@ -103,7 +198,7 @@ export async function cmdAdd(
         throw usageError(
           `add ${input}`,
           `is a ${parsed.kind}, and playlist or channel sync is not implemented in v1`,
-          "pass one video URL at a time; `ytx sync` is a stub",
+          "pass one video URL at a time; `ytx sync` is not implemented in v1",
         );
       }
       throw usageError(
@@ -114,6 +209,15 @@ export async function cmdAdd(
     }
     return { url: canonicalWatchUrl(parsed.id), id: parsed.id };
   });
+
+  // Preflight runs before ensureLibrary so a dependency failure does not even
+  // create the store skeleton on a fresh machine.
+  await preflightAdd(context, flags);
+
+  ensureLibrary(context);
+  context.config.max_height = flags.maxHeight;
+  const acquired: string[] = [];
+  const failures: YtxError[] = [];
 
   const limit = Math.max(1, flags.parallel);
   let cursor = 0;
@@ -174,53 +278,140 @@ async function addOne(
     throw new YtxError({
       what: `add ${videoId}`,
       why: `is already archived in ${dir}`,
-      next: `use \`ytx transcript ${videoId}\` to refresh its transcript, or \`ytx add --force\` to re-archive`,
+      next: `use \`ytx add --force\` to re-archive it, or \`ytx show ${videoId}\` to read the transcript`,
       code: EXIT.usage,
       kind: "already-archived",
     });
   }
 
-  mkdirSync(dir, { recursive: true });
   ui.note(`fetching metadata for ${videoId}…`);
   const info = await fetchInfo(url, { ...context.downloader, browser: resolveBrowser(flags, context) });
   const raw = info.info;
   const durationS = typeof raw.duration === "number" && raw.duration > 0 ? raw.duration : 0;
 
-  const acquired = await acquireTranscript(context, {
-    videoId,
-    url,
-    durationS,
-    availability: info.availability,
-    ytdlpVersion: info.version,
-    videoDir: dir,
-    ensureAudio: async () => {
-      const { downloadAudioStream, findExistingAudio } = await import("../ytdlp/run.ts");
-      const present = findExistingAudio(dir, videoId);
-      if (present) return present;
-      requireFfmpeg(context);
-      ui.note("  downloading audio for transcription…");
-      const stream = await downloadAudioStream(url, videoId, dir, context.downloader, []);
-      return stream.path;
-    },
-    options: acquisitionOptions(context, {
-      quality: flags.quality,
-      language: flags.language,
-      forceAsr: flags.asr,
-      noAsr: flags.noAsr,
-      strictLang: flags.strictLang,
-    }),
-  });
+  // Acquisition writes only to this scratch directory. The library directory
+  // appears after a transcript exists, so a failed acquisition leaves no
+  // meta-less record directory behind.
+  mkdirSync(context.runtime.tmp, { recursive: true });
+  const staging = mkdtempSync(join(context.runtime.tmp, `add-${videoId}-`));
+  try {
+    const acquired = await acquireTranscript(context, {
+      videoId,
+      url,
+      durationS,
+      availability: info.availability,
+      ytdlpVersion: info.version,
+      videoDir: staging,
+      ensureAudio: async () => {
+        const present = findExistingAudio(dir, videoId);
+        if (present) return present;
+        const staged = findExistingAudio(staging, videoId);
+        if (staged) return staged;
+        requireFfmpeg(context);
+        ui.note("  downloading audio for transcription…");
+        const stream = await downloadAudioStream(url, videoId, staging, context.downloader, []);
+        return stream.path;
+      },
+      options: acquisitionOptions(context, {
+        quality: flags.quality,
+        language: flags.language,
+        forceAsr: flags.asr,
+        noAsr: flags.noAsr,
+        strictLang: flags.strictLang,
+        allowRepetitive: flags.allowRepetitive,
+      }),
+    });
 
-  if (acquired.rawCaption) {
-    const captionFile = join(dir, `caption.${acquired.rawCaption.language}.vtt`);
-    // Raw platform tracks are immutable: never overwrite an existing one.
-    if (!existsSync(captionFile)) writeFileSync(captionFile, acquired.rawCaption.vtt, "utf8");
+    // The transcript exists; from here on the library is written deliberately.
+    mkdirSync(dir, { recursive: true });
+    if (acquired.rawCaption) {
+      const captionFile = join(dir, `caption.${acquired.rawCaption.language}.vtt`);
+      // Raw platform tracks are immutable: never overwrite an existing one.
+      if (!existsSync(captionFile)) writeFileSync(captionFile, acquired.rawCaption.vtt, "utf8");
+    }
+    // Keep the audio downloaded for ASR only when media will be archived too:
+    // it is the original track and saves a second download. `--transcript-only`
+    // means no media files, so the scratch copy is discarded with the staging
+    // directory instead of leaving an unrecorded m4a beside the transcript.
+    if (!flags.noMedia) {
+      const stagedAudio = findExistingAudio(staging, videoId);
+      if (stagedAudio && !findExistingAudio(dir, videoId)) {
+        renameSync(stagedAudio, join(dir, basename(stagedAudio)));
+      }
+    }
+
+    writeTranscript(context.library, videoId, acquired.segments);
+
+    const now = new Date().toISOString();
+    const transcript = transcriptRecordOf(acquired, info.version, info.source, now);
+
+    const previous = existing.ok ? existing.meta : null;
+    const previousTranscript = previous
+      ? ({ ...previous.transcript, superseded_at: now } satisfies TranscriptHistoryEntry)
+      : null;
+
+    const meta: Meta = {
+      schema: 1,
+      id: videoId,
+      url,
+      title: typeof raw.title === "string" ? raw.title : videoId,
+      channel: channelOf(raw),
+      duration_s: durationS,
+      published: publishedOf(raw),
+      chapters: chaptersOf(raw),
+      media: previous?.media ?? { video: null, audio: null, mp3: null, height: null },
+      transcript,
+      transcript_history: [
+        ...(previous?.transcript_history ?? []),
+        ...(previousTranscript ? [previousTranscript] : []),
+      ],
+      warnings: acquired.warnings,
+      added_at: previous?.added_at ?? now,
+      updated_at: now,
+    };
+    writeMeta(context.library, meta);
+    ui.ok(`${videoId} transcript archived (${acquired.source}, ${acquired.segments.length} segments)`);
+    for (const warning of acquired.warnings) ui.warn(`  recorded warning: ${warning}`);
+
+    if (flags.noMedia) return meta;
+
+    try {
+      await downloadAndAttachMedia(context, meta, url, flags);
+    } catch (err) {
+      const error = asYtxError(err, `download media for ${videoId}`, "run `ytx retry` to try again");
+      enqueue(context.library, {
+        id: videoId,
+        url,
+        failure_class: error.failureClass === "format-unavailable" ? "format-unavailable" : "transient",
+        attempts: 0,
+        next_attempt_at: new Date().toISOString(),
+        added_at: new Date().toISOString(),
+        last_error: `${error.what}: ${error.why}`,
+        stage: "media",
+      });
+      throw new YtxError({
+        what: `add ${videoId}`,
+        why: `the transcript is archived, but the media download failed: ${error.why}`,
+        next: `${error.next}; \`ytx retry\` re-attempts the media only`,
+        code: EXIT.fetch,
+        failureClass: error.failureClass,
+        kind: "media-pending",
+      });
+    }
+
+    return meta;
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
   }
+}
 
-  writeTranscript(context.library, videoId, acquired.segments);
-
-  const now = new Date().toISOString();
-  const transcript: TranscriptRecord = {
+function transcriptRecordOf(
+  acquired: Awaited<ReturnType<typeof acquireTranscript>>,
+  ytdlpVersion: string,
+  ytdlpSource: "managed" | "system",
+  now: string,
+): TranscriptRecord {
+  return {
     source: acquired.source,
     language: acquired.language,
     coverage: acquired.coverage,
@@ -229,62 +420,8 @@ async function addOne(
     fetched_at: now,
     ...(acquired.source === "asr"
       ? { model: acquired.model ?? "unknown", model_revision: acquired.modelRevision ?? "unknown" }
-      : { ytdlp_version: acquired.ytdlpVersion ?? info.version }),
+      : { ytdlp_version: acquired.ytdlpVersion ?? ytdlpVersion, ytdlp_source: ytdlpSource }),
   };
-
-  const previous = existing.ok ? existing.meta : null;
-  const previousTranscript = previous
-    ? { ...previous.transcript, superseded_at: now } satisfies TranscriptHistoryEntry
-    : null;
-
-  const meta: Meta = {
-    schema: 1,
-    id: videoId,
-    url,
-    title: typeof raw.title === "string" ? raw.title : videoId,
-    channel: channelOf(raw),
-    duration_s: durationS,
-    published: publishedOf(raw),
-    chapters: chaptersOf(raw),
-    media: previous?.media ?? { video: null, audio: null, mp3: null, height: null },
-    transcript,
-    transcript_history: [
-      ...(previous?.transcript_history ?? []),
-      ...(previousTranscript ? [previousTranscript] : []),
-    ],
-    added_at: previous?.added_at ?? now,
-    updated_at: now,
-  };
-  writeMeta(context.library, meta);
-  ui.ok(`${videoId} transcript archived (${acquired.source}, ${acquired.segments.length} segments)`);
-
-  if (flags.noMedia) return meta;
-
-  try {
-    await downloadAndAttachMedia(context, meta, url, flags);
-  } catch (err) {
-    const error = asYtxError(err, `download media for ${videoId}`, "run `ytx retry` to try again");
-    enqueue(context.library, {
-      id: videoId,
-      url,
-      failure_class: error.failureClass === "format-unavailable" ? "format-unavailable" : "transient",
-      attempts: 0,
-      next_attempt_at: new Date().toISOString(),
-      added_at: new Date().toISOString(),
-      last_error: `${error.what}: ${error.why}`,
-      stage: "media",
-    });
-    throw new YtxError({
-      what: `add ${videoId}`,
-      why: `the transcript is archived, but the media download failed: ${error.why}`,
-      next: `${error.next}; \`ytx retry\` re-attempts the media only`,
-      code: EXIT.fetch,
-      failureClass: error.failureClass,
-      kind: "media-pending",
-    });
-  }
-
-  return meta;
 }
 
 export async function downloadAndAttachMedia(
@@ -317,7 +454,13 @@ export async function downloadAndAttachMedia(
     ...context.state,
     ytdlp: context.state.ytdlp
       ? context.state.ytdlp
-      : { version: "unknown", channel: "stable", installed_at: new Date().toISOString(), previous_version: null },
+      : {
+          version: "unknown",
+          channel: "stable",
+          source: context.downloader.source,
+          installed_at: new Date().toISOString(),
+          previous_version: null,
+        },
   };
   saveState(context.runtime.state, context.state);
 
@@ -330,79 +473,138 @@ export async function downloadAndAttachMedia(
   return media;
 }
 
+/**
+ * `transcript <url>` fetches and prints without writing; `transcript <id>` reads
+ * the store and prints in the requested format. A URL never mutates a library.
+ */
 export async function cmdTranscript(
   context: CommandContext,
   positionals: string[],
-  flags: QuestionFlags,
+  flags: TranscriptFlags,
 ): Promise<void> {
-  const target = requireTarget(positionals, "transcript");
-  const meta = readMeta(context.library, target);
-
-  const info = await fetchInfo(meta.url, context.downloader);
-  const durationS = typeof info.info.duration === "number" ? info.info.duration : meta.duration_s;
-  const dir = videoDir(context.library, meta.id);
-
-  const acquired = await acquireTranscript(context, {
-    videoId: meta.id,
-    url: meta.url,
-    durationS,
-    availability: info.availability,
-    ytdlpVersion: info.version,
-    videoDir: dir,
-    ensureAudio: async () => {
-      const { downloadAudioStream, findExistingAudio } = await import("../ytdlp/run.ts");
-      const present = findExistingAudio(dir, meta.id);
-      if (present) return present;
-      requireFfmpeg(context);
-      const stream = await downloadAudioStream(meta.url, meta.id, dir, context.downloader, []);
-      return stream.path;
-    },
-    options: acquisitionOptions(context, {
-      quality: flags.quality,
-      language: flags.language,
-      forceAsr: flags.asr,
-      noAsr: flags.noAsr,
-      strictLang: flags.strictLang,
-    }),
-  });
-
-  if (acquired.rawCaption) {
-    const captionFile = join(dir, `caption.${acquired.rawCaption.language}.vtt`);
-    if (!existsSync(captionFile)) writeFileSync(captionFile, acquired.rawCaption.vtt, "utf8");
+  const input = positionals[0];
+  if (!input) {
+    throw usageError(
+      "transcript",
+      "needs a video id or URL",
+      "run `ytx transcript <url>` to preview, or `ytx transcript <id>` to read the store",
+    );
   }
-  writeTranscript(context.library, meta.id, acquired.segments);
 
-  const now = new Date().toISOString();
-  const next: TranscriptRecord = {
-    source: acquired.source,
-    language: acquired.language,
-    coverage: acquired.coverage,
-    segments: acquired.segments.length,
-    chars: acquired.segments.reduce((total, segment) => total + segment.text.length, 0),
-    fetched_at: now,
-    ...(acquired.source === "asr"
-      ? { model: acquired.model ?? "unknown", model_revision: acquired.modelRevision ?? "unknown" }
-      : { ytdlp_version: acquired.ytdlpVersion ?? info.version }),
-  };
+  const looksLikeUrl = !/^[A-Za-z0-9_-]{11}$/.test(input.trim());
+  if (looksLikeUrl) {
+    return previewTranscript(context, input, flags);
+  }
 
-  // Every rewrite appends the superseded entry; nothing is lost.
-  meta.transcript_history = [
-    ...meta.transcript_history,
-    { ...meta.transcript, superseded_at: now },
-  ];
-  meta.transcript = next;
-  meta.updated_at = now;
-  writeMeta(context.library, meta);
+  const meta = readMeta(context.library, input);
+  const segments = readTranscript(context.library, input);
+  outputTranscript(context, {
+    id: meta.id,
+    source: meta.transcript.source,
+    language: meta.transcript.language,
+    segments,
+    format: flags.format,
+    timestamps: flags.timestamps,
+    meta,
+  });
+}
 
-  context.ui.ok(`${meta.id} transcript replaced (${acquired.source}, ${acquired.segments.length} segments)`);
-  context.ui.line(`  ${provenanceLine(meta)}`);
-  context.ui.emit({ id: meta.id, transcript: next, attempts: acquired.attempts });
+async function previewTranscript(
+  context: CommandContext,
+  input: string,
+  flags: TranscriptFlags,
+): Promise<void> {
+  const parsed = parseVideoUrl(input);
+  if (parsed.id === null) {
+    throw usageError(
+      `transcript ${input}`,
+      "is not a YouTube video URL",
+      "pass a watch URL, youtu.be link, or an archived 11-character id",
+    );
+  }
+  await requireDownloader(context);
+  if (flags.asr) await requireAsrReady(context);
+
+  const videoId = parsed.id;
+  const url = canonicalWatchUrl(videoId);
+  const info = await fetchInfo(url, { ...context.downloader, browser: context.config.browser });
+  const durationS = typeof info.info.duration === "number" ? info.info.duration : 0;
+
+  mkdirSync(context.runtime.tmp, { recursive: true });
+  const staging = mkdtempSync(join(context.runtime.tmp, `transcript-${videoId}-`));
+  try {
+    const acquired = await acquireTranscript(context, {
+      videoId,
+      url,
+      durationS,
+      availability: info.availability,
+      ytdlpVersion: info.version,
+      videoDir: staging,
+      ensureAudio: async () => {
+        requireFfmpeg(context);
+        context.ui.note("  downloading audio for transcription…");
+        const stream = await downloadAudioStream(url, videoId, staging, context.downloader, []);
+        return stream.path;
+      },
+      options: acquisitionOptions(context, {
+        quality: flags.quality,
+        language: flags.language,
+        forceAsr: flags.asr,
+        noAsr: flags.noAsr,
+        strictLang: flags.strictLang,
+        allowRepetitive: flags.allowRepetitive,
+      }),
+    });
+
+    // Preview only: nothing is written to the library.
+    context.ui.note(
+      `  ${acquired.source} · ${acquired.language} · ${acquired.segments.length} segments (not written)`,
+    );
+    outputTranscript(context, {
+      id: videoId,
+      source: acquired.source,
+      language: acquired.language,
+      segments: acquired.segments,
+      format: flags.format,
+      timestamps: flags.timestamps,
+      warnings: acquired.warnings,
+    });
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+function outputTranscript(
+  context: CommandContext,
+  input: {
+    id: string;
+    source: Provenance;
+    language: string;
+    segments: TranscriptSegment[];
+    format: TranscriptFormat;
+    timestamps: boolean;
+    warnings?: string[];
+    meta?: Meta;
+  },
+): void {
+  if (context.flags.json) {
+    context.ui.emit({
+      id: input.id,
+      source: input.source,
+      language: input.language,
+      format: input.format,
+      warnings: input.warnings ?? input.meta?.warnings ?? [],
+      segments: input.segments,
+    });
+    return;
+  }
+  process.stdout.write(renderTranscript(input.segments, input.format, { timestamps: input.timestamps }));
 }
 
 export async function cmdShow(
   context: CommandContext,
   positionals: string[],
-  flags: { raw: boolean; timestamps: boolean; history: boolean },
+  flags: ShowFlags,
 ): Promise<void> {
   const id = requireTarget(positionals, "show");
   const meta = readMeta(context.library, id);
@@ -412,15 +614,13 @@ export async function cmdShow(
     if (context.flags.json) {
       context.ui.emit({ id, transcript: segments });
     } else {
-      process.stdout.write(readFileSync(join(videoDir(context.library, id), TRANSCRIPT_TXT), "utf8"));
+      process.stdout.write(renderTranscript(segments, flags.format, { timestamps: flags.timestamps }));
     }
     return;
   }
 
-  if (flags.timestamps && !context.flags.json) {
-    for (const segment of segments) {
-      context.ui.line(`${formatClock(segment.start)}  ${segment.text}`);
-    }
+  if (context.flags.json) {
+    context.ui.emit({ meta, segments, format: flags.format });
     return;
   }
 
@@ -429,15 +629,19 @@ export async function cmdShow(
   ui.line(`${meta.id} · ${formatDuration(meta.duration_s)} · published ${meta.published ?? "unknown"}`);
   ui.line(`provenance  ${provenanceLine(meta)}`);
   ui.line(`media       ${mediaLine(meta)}`);
-  ui.line(`added       ${meta.added_at}${meta.transcript_history.length > 0 ? ` · ${meta.transcript_history.length} earlier transcript(s)` : ""}`);
+  ui.line(
+    `added       ${meta.added_at}${meta.transcript_history.length > 0 ? ` · ${meta.transcript_history.length} earlier transcript(s)` : ""}`,
+  );
   const chapters = chapterLines(meta);
   if (chapters.length > 0) {
     ui.line("chapters");
     for (const chapter of chapters) ui.line(chapter);
   }
+  if (meta.warnings.length > 0) {
+    for (const warning of meta.warnings) ui.warn(`  recorded warning: ${warning}`);
+  }
   ui.line("");
-  for (const segment of segments) ui.line(segment.text);
-  ui.emit({ meta, segments });
+  process.stdout.write(renderTranscript(segments, flags.format, { timestamps: flags.timestamps }));
 
   if (flags.history) {
     for (const entry of meta.transcript_history) {
@@ -446,13 +650,12 @@ export async function cmdShow(
   }
 }
 
-export async function cmdList(
-  context: CommandContext,
-  flags: { source?: string; sort?: string; limit?: number },
-): Promise<void> {
+export async function cmdList(context: CommandContext, flags: ListFlags): Promise<void> {
   const { records, broken } = readAllMeta(context.library);
   const wanted = flags.source ? provenanceFilter(flags.source) : null;
-  const filtered = wanted ? records.filter((record) => record.transcript.source === wanted) : records;
+  let filtered = wanted ? records.filter((record) => record.transcript.source === wanted) : records;
+  if (flags.missingTranscript) filtered = filtered.filter((record) => missingTranscript(context, record));
+  if (flags.missingMedia) filtered = filtered.filter((record) => missingMedia(context, record));
 
   const sorted = [...filtered].sort((a, b) => {
     if (flags.sort === "title") return a.title.localeCompare(b.title);
@@ -501,6 +704,8 @@ export async function cmdList(
       segments: record.transcript.segments,
       chars: record.transcript.chars,
       coverage: record.transcript.coverage,
+      missing_transcript: missingTranscript(context, record),
+      missing_media: missingMedia(context, record),
       added_at: record.added_at,
     })),
     broken: broken.map((entry) => ({ id: entry.id, error: entry.error.toJSON() })),
@@ -510,7 +715,7 @@ export async function cmdList(
 export async function cmdSearch(
   context: CommandContext,
   positionals: string[],
-  flags: { source?: string; limit: number; context: number; ids?: string[] },
+  flags: SearchFlags,
 ): Promise<void> {
   const query = positionals.join(" ").trim();
   if (query === "") {
@@ -521,20 +726,47 @@ export async function cmdSearch(
   const wanted = flags.source ? provenanceFilter(flags.source) : null;
   const candidates = wanted ? records.filter((record) => record.transcript.source === wanted) : records;
 
+  type Where = "title" | "channel" | "transcript";
   type Match = {
     id: string;
     title: string;
+    channel: string;
     source: Provenance;
     marker: string;
-    start: number;
-    end: number;
+    where: Where;
+    start: number | null;
+    end: number | null;
     text: string;
     snippet: string;
   };
   const matches: Match[] = [];
 
+  const push = (record: Meta, where: Where, text: string, index: number, start: number | null, end: number | null) => {
+    matches.push({
+      id: record.id,
+      title: record.title,
+      channel: record.channel.name,
+      source: record.transcript.source,
+      marker: markerOf(record),
+      where,
+      start,
+      end,
+      text,
+      snippet: snippet(text, index, needle.length, flags.context),
+    });
+  };
+
   for (const record of candidates) {
     if (flags.ids && flags.ids.length > 0 && !flags.ids.includes(record.id)) continue;
+
+    if (!flags.transcriptsOnly) {
+      const titleIndex = record.title.toLowerCase().indexOf(needle);
+      if (titleIndex >= 0) push(record, "title", record.title, titleIndex, null, null);
+      const channelIndex = record.channel.name.toLowerCase().indexOf(needle);
+      if (channelIndex >= 0) push(record, "channel", record.channel.name, channelIndex, null, null);
+      if (matches.length >= flags.limit) break;
+    }
+
     let segments: TranscriptSegment[];
     try {
       segments = readTranscript(context.library, record.id);
@@ -544,16 +776,7 @@ export async function cmdSearch(
     for (const segment of segments) {
       const index = segment.text.toLowerCase().indexOf(needle);
       if (index < 0) continue;
-      matches.push({
-        id: record.id,
-        title: record.title,
-        source: record.transcript.source,
-        marker: markerOf(record),
-        start: segment.start,
-        end: segment.end,
-        text: segment.text,
-        snippet: snippet(segment.text, index, needle.length, flags.context),
-      });
+      push(record, "transcript", segment.text, index, segment.start, segment.end);
       if (matches.length >= flags.limit) break;
     }
     if (matches.length >= flags.limit) break;
@@ -564,31 +787,57 @@ export async function cmdSearch(
       context.ui.line(`no matches for "${query}"`);
     } else {
       for (const match of matches) {
+        const time = match.where === "transcript" && match.start !== null ? ` ${context.ui.cyan(formatClock(match.start))}` : "";
         context.ui.line(
-          `${match.marker} ${context.ui.bold(match.id)} ${context.ui.cyan(formatClock(match.start))}  ${match.snippet}`,
+          `${match.marker} ${context.ui.bold(match.id)} ${context.ui.dim(match.where.padEnd(10))}${time}  ${match.snippet}`,
         );
       }
       context.ui.note(`${matches.length} match(es) for "${query}"`);
     }
   }
-  context.ui.emit({ query, matches });
+  context.ui.emit({ query, transcripts_only: flags.transcriptsOnly, matches });
 }
 
-export async function cmdRetry(
-  context: CommandContext,
-  flags: { all: boolean; limit: number },
-): Promise<void> {
+export async function cmdRetry(context: CommandContext, flags: RetryFlags): Promise<void> {
   const entries = flags.all ? readQueue(context.library) : dueEntries(context.library);
   if (entries.length === 0) {
     context.ui.line("queue is empty; nothing to retry");
-    context.ui.emit({ retried: [], remaining: readQueue(context.library).length });
+    context.ui.emit({ retried: [], exhausted: [], failed: [], dry_run: flags.dryRun, remaining: readQueue(context.library).length });
+    return;
+  }
+
+  const planned = entries.slice(0, flags.limit);
+  if (flags.dryRun) {
+    if (!context.flags.json) {
+      for (const entry of planned) {
+        context.ui.line(
+          `${entry.id}  ${entry.stage}  attempts ${entry.attempts}  next ${entry.next_attempt_at}  ${context.ui.dim(entry.last_error)}`,
+        );
+      }
+      context.ui.note(`${planned.length} queued item(s); --dry-run changed nothing`);
+    }
+    context.ui.emit({
+      dry_run: true,
+      retried: [],
+      exhausted: [],
+      failed: [],
+      planned: planned.map((entry) => ({ ...entry })),
+      remaining: readQueue(context.library).length,
+    });
     return;
   }
 
   const retried: string[] = [];
   const failed: { id: string; reason: string }[] = [];
+  const exhausted: string[] = [];
 
-  for (const entry of entries.slice(0, flags.limit)) {
+  for (const entry of planned) {
+    if (flags.maxAttempts !== null && entry.attempts >= flags.maxAttempts) {
+      removeFromQueue(context.library, entry.id);
+      exhausted.push(entry.id);
+      context.ui.warn(`${entry.id} failed ${entry.attempts} time(s); removed from the queue (--max-attempts ${flags.maxAttempts})`);
+      continue;
+    }
     context.ui.note(`retrying ${entry.id} (${entry.stage})…`);
     try {
       if (entry.stage === "add") {
@@ -631,7 +880,13 @@ export async function cmdRetry(
     }
   }
 
-  const payload = { retried, failed, remaining: readQueue(context.library).length };
+  const payload = {
+    retried,
+    exhausted,
+    failed,
+    dry_run: false,
+    remaining: readQueue(context.library).length,
+  };
   if (failed.length > 0 && retried.length === 0) {
     failAfterEmit(
       context,
@@ -660,6 +915,7 @@ export function defaultAddFlags(context: CommandContext): AddFlags {
     asr: false,
     noAsr: false,
     strictLang: false,
+    allowRepetitive: false,
   };
 }
 
@@ -673,7 +929,7 @@ export async function cmdRm(
   }
   const targets = positionals.map((input) => parseVideoUrl(input).id ?? input);
   const lock = acquireLock(context.runtime.locks, "library", `ytx rm`);
-  const removed: string[] = [];
+  const removed: { id: string; freed_bytes: number }[] = [];
   try {
     for (const id of targets) {
       const dir = videoDir(context.library, id);
@@ -697,13 +953,15 @@ export async function cmdRm(
       }
       const size = dirSize(dir);
       rmSync(dir, { recursive: true, force: true });
-      removed.push(id);
+      removed.push({ id, freed_bytes: size });
       context.ui.ok(`removed ${id} (${formatBytes(size)} freed)`);
     }
   } finally {
     lock.release();
   }
-  context.ui.emit({ removed });
+  const total = removed.reduce((sum, entry) => sum + entry.freed_bytes, 0);
+  if (removed.length > 0) context.ui.line(`${formatBytes(total)} reclaimed in total`);
+  context.ui.emit({ removed: removed.map((entry) => entry.id), freed_bytes: total, items: removed });
 }
 
 export async function cmdPrune(
@@ -721,7 +979,12 @@ export async function cmdPrune(
     for (const id of listVideoIds(context.library)) {
       const dir = videoDir(context.library, id);
       if (existsSync(join(dir, META_FILE))) continue;
-      targets.push({ path: dir, reason: "video directory without meta.json", bytes: dirSize(dir) });
+      const empty = dirSize(dir) === 0;
+      targets.push({
+        path: dir,
+        reason: empty ? "empty video directory" : "video directory without meta.json",
+        bytes: dirSize(dir),
+      });
     }
   }
 
@@ -766,21 +1029,27 @@ export async function cmdSync(_context: CommandContext, positionals: string[]): 
   void positionals;
   throw new YtxError({
     what: "sync",
-    why: "playlist and channel sync is a stub in v1; it is not implemented",
-    next: "archiving individual videos with `ytx add <url>` is fully supported",
+    why: "playlist and channel sync is not implemented in v1",
+    next: "archive individual videos with `ytx add <url>`; that is fully supported",
     code: EXIT.usage,
     kind: "not-implemented",
   });
 }
 
+export function parseTranscriptFormat(value: string | undefined): TranscriptFormat {
+  if (value === undefined) return "txt";
+  if ((TRANSCRIPT_FORMATS as readonly string[]).includes(value)) return value as TranscriptFormat;
+  throw usageError(
+    `--format ${value}`,
+    "is not a transcript format",
+    `use one of ${TRANSCRIPT_FORMATS.join(", ")}`,
+  );
+}
+
 function requireTarget(positionals: string[], command: string): string {
   const input = positionals[0];
   if (!input) {
-    throw usageError(
-      command,
-      "needs a video id or URL",
-      "run `ytx list` to see archived videos",
-    );
+    throw usageError(command, "needs a video id or URL", "run `ytx list` to see archived videos");
   }
   const parsed = parseVideoUrl(input);
   if (parsed.id === null) {
@@ -850,8 +1119,25 @@ function chaptersOf(info: YtdlpRawInfo): Meta["chapters"] {
     .map((chapter) => ({ start_s: Number(chapter.start_time), title: String(chapter.title) }));
 }
 
-function basename(path: string): string {
-  return path.split("/").pop() ?? path;
+/** A record has no usable transcript file, or its transcript is empty. */
+function missingTranscript(context: CommandContext, record: Meta): boolean {
+  const dir = videoDir(context.library, record.id);
+  if (!existsSync(join(dir, TRANSCRIPT_JSON)) && !existsSync(join(dir, TRANSCRIPT_TXT))) return true;
+  try {
+    return readTranscript(context.library, record.id).length === 0;
+  } catch {
+    return true;
+  }
+}
+
+/** Any recorded media file is absent, or the record has no media at all. */
+function missingMedia(context: CommandContext, record: Meta): boolean {
+  const dir = videoDir(context.library, record.id);
+  const names = [record.media.video, record.media.audio, record.media.mp3].filter(
+    (name): name is string => typeof name === "string",
+  );
+  if (names.length === 0) return true;
+  return names.some((name) => !existsSync(join(dir, name)));
 }
 
 function dirSize(path: string): number {

@@ -17,6 +17,9 @@ export const REPETITION_MAX = 0.25;
 
 export type GateName = "coverage" | "language" | "density" | "repetition";
 
+/** Which tier produced the track; the repetition gate depends on it. */
+export type GateSource = "caption-human" | "caption-auto" | "asr";
+
 export interface GateFailure {
   gate: GateName;
   detail: string;
@@ -35,6 +38,8 @@ export interface GateMetrics {
 export interface GateResult {
   pass: boolean;
   failures: GateFailure[];
+  /** Non-fatal observations that belong in the record, not in a rejection. */
+  warnings: GateFailure[];
   metrics: GateMetrics;
 }
 
@@ -47,6 +52,35 @@ export interface GateInput {
   wantLanguage: string;
   detected: LanguageGuess;
   duplicateLineRatio: number;
+  /** Tier that produced the track. */
+  source: GateSource;
+  /** `--allow-repetitive`: never reject on repetition, for any source. */
+  allowRepetitive?: boolean;
+}
+
+/**
+ * Repetition is a track defect for platform machine captions, but human
+ * captions legitimately repeat a chorus, a chant, or a refrain. The gate is
+ * therefore source-aware: reject `caption-auto`, warn for `caption-human` and
+ * for local ASR, and let `--allow-repetitive` silence it entirely.
+ */
+export function repetitionVerdict(
+  source: GateSource,
+  duplicateLineRatio: number,
+  allowRepetitive = false,
+): { failure: GateFailure | null; warning: GateFailure | null } {
+  if (allowRepetitive || duplicateLineRatio <= REPETITION_MAX) {
+    return { failure: null, warning: null };
+  }
+  const detail = `${(duplicateLineRatio * 100).toFixed(1)}% duplicate lines > ${(REPETITION_MAX * 100).toFixed(0)}%`;
+  if (source === "caption-auto") {
+    return { failure: { gate: "repetition", detail }, warning: null };
+  }
+  const why =
+    source === "caption-human"
+      ? "allowed: human captions may repeat a chorus or refrain"
+      : "report only: local transcription is kept even when it repeats";
+  return { failure: null, warning: { gate: "repetition", detail: `${detail}; ${why}` } };
 }
 
 export function coverageOf(cues: readonly Cue[], durationS: number): number {
@@ -66,6 +100,7 @@ export function evaluateGates(input: GateInput): GateResult {
   const lastCueEnd = cues[cues.length - 1]?.end ?? 0;
 
   const failures: GateFailure[] = [];
+  const warnings: GateFailure[] = [];
 
   if (cues.length === 0) {
     failures.push({ gate: "coverage", detail: "no cues survived normalization" });
@@ -90,16 +125,14 @@ export function evaluateGates(input: GateInput): GateResult {
     });
   }
 
-  if (duplicateLineRatio > REPETITION_MAX) {
-    failures.push({
-      gate: "repetition",
-      detail: `${(duplicateLineRatio * 100).toFixed(1)}% duplicate lines > ${(REPETITION_MAX * 100).toFixed(0)}%`,
-    });
-  }
+  const repetition = repetitionVerdict(input.source, duplicateLineRatio, input.allowRepetitive);
+  if (repetition.failure) failures.push(repetition.failure);
+  if (repetition.warning) warnings.push(repetition.warning);
 
   return {
     pass: failures.length === 0,
     failures,
+    warnings,
     metrics: {
       coverage,
       chars_per_minute: density,

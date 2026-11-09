@@ -9,10 +9,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { noTranscriptError, qualityError, YtxError } from "../core/errors.ts";
+import { noTranscriptError, qualityError, usageError, YtxError } from "../core/errors.ts";
 import { detectLanguage, type LanguageGuess } from "../captions/lang.ts";
-import { describeFailures, evaluateGates, type GateMetrics } from "../captions/gates.ts";
-import { normalizeTrack, segmentCues, type NormalizedTrack } from "../captions/normalize.ts";
+import { describeFailures, evaluateGates, repetitionVerdict, type GateMetrics } from "../captions/gates.ts";
+import { duplicateLineRatioOf, normalizeTrack, segmentCues, type NormalizedTrack } from "../captions/normalize.ts";
+import { catalogChoices } from "../models/catalog.ts";
+import { configuredModel } from "../models/manager.ts";
 import { planLadder, type Availability, type LadderPlan } from "../captions/ladder.ts";
 import { parseCaptions, toVtt, type ParsedCaptions } from "../captions/vtt.ts";
 import type { TranscriptSegment } from "../core/schema.ts";
@@ -27,6 +29,8 @@ export interface AcquisitionOptions {
   forceAsr: boolean;
   noAsr: boolean;
   strictLang: boolean;
+  /** `--allow-repetitive`: the repetition gate never rejects. */
+  allowRepetitive?: boolean;
 }
 
 export interface AttemptRecord {
@@ -45,6 +49,8 @@ export interface AcquiredTranscript {
   segments: TranscriptSegment[];
   /** Raw platform track, exactly as fetched (converted to VTT only in name). */
   rawCaption: { language: string; vtt: string } | null;
+  /** Non-fatal gate observations, recorded in meta.json. */
+  warnings: string[];
   model: string | null;
   modelRevision: string | null;
   ytdlpVersion: string | null;
@@ -61,6 +67,23 @@ export interface AcquireContext extends CommandContext {
   downloader: DownloaderOptions;
 }
 
+/**
+ * The configured ASR model, or a usage error naming every catalog choice. The
+ * check runs before audio is downloaded, so a machine with no model never pays
+ * for a download it cannot use.
+ */
+export function assertAsrConfigured(context: CommandContext): string {
+  const name = configuredModel(context.state.default_model, context.config.asr_model);
+  if (name === "none") {
+    throw usageError(
+      "transcription",
+      'no local model is configured (asr_model = "none")',
+      `choose one with \`ytx models add <name>\` (${catalogChoices()}), then \`ytx models default <name>\``,
+    );
+  }
+  return name;
+}
+
 export function acquisitionOptions(
   context: CommandContext,
   overrides: Partial<AcquisitionOptions> = {},
@@ -71,6 +94,7 @@ export function acquisitionOptions(
     forceAsr: false,
     noAsr: false,
     strictLang: false,
+    allowRepetitive: false,
     ...overrides,
   };
 }
@@ -119,9 +143,10 @@ export async function acquireTranscript(
   try {
     for (const step of plan.steps) {
       if (step.source === "asr") {
+        assertAsrConfigured(context);
         ui.note(`  tier 4 · transcribing locally`);
         const audio = await input.ensureAudio();
-        const acquired = await runAsr(context, audio, input.durationS, workRoot, attempts);
+        const acquired = await runAsr(context, audio, input.durationS, workRoot, attempts, options);
         if (acquired) {
           return { ...acquired, plan, attempts };
         }
@@ -196,6 +221,8 @@ export async function acquireTranscript(
         wantLanguage: step.language === "auto" ? "auto" : options.language,
         detected,
         duplicateLineRatio: normalized.duplicate_line_ratio,
+        source: step.source,
+        allowRepetitive: options.allowRepetitive,
       });
 
       if (!gates.pass) {
@@ -213,15 +240,17 @@ export async function acquireTranscript(
         continue;
       }
 
+      const warnings = gates.warnings.map((warning) => `${warning.gate}: ${warning.detail}`);
       attempts.push({
         tier: step.tier,
         source: step.source,
         language: step.language,
         track: trackKey,
         accepted: true,
-        reason: "passed every gate",
+        reason: warnings.length > 0 ? `passed every gate; ${warnings.join("; ")}` : "passed every gate",
         metrics: gates.metrics,
       });
+      for (const warning of warnings) ui.warn(`    ${warning}`);
 
       return {
         source: step.source,
@@ -232,6 +261,7 @@ export async function acquireTranscript(
           // SRT is converted to WebVTT text; the cues themselves are untouched.
           vtt: track.ext === "vtt" ? track.text : toVtt(parsed.cues),
         },
+        warnings,
         model: null,
         modelRevision: null,
         ytdlpVersion: input.ytdlpVersion,
@@ -286,23 +316,11 @@ async function runAsr(
   durationS: number,
   workRoot: string,
   attempts: AttemptRecord[],
+  options: AcquisitionOptions,
 ): Promise<Omit<AcquiredTranscript, "plan" | "attempts"> | null> {
-  const { runtime, state } = context;
-  const modelName = context.config.asr_model;
-  if (modelName === "none") {
-    attempts.push({
-      tier: 4,
-      source: "asr",
-      language: context.config.language,
-      track: null,
-      accepted: false,
-      reason: "no transcription model is configured (asr_model = \"none\")",
-    });
-    return null;
-  }
-
-  const { effectiveDefault, resolveModelPath } = await import("../models/manager.ts");
-  const name = effectiveDefault(state.default_model ?? modelName);
+  const { runtime } = context;
+  const { resolveModelPath } = await import("../models/manager.ts");
+  const name = assertAsrConfigured(context);
   let modelPath: string;
   let manifestRevision: string;
   let modelRepo: string;
@@ -348,6 +366,10 @@ async function runAsr(
 
   const lastEnd = result.segments[result.segments.length - 1]?.end ?? 0;
   const coverage = durationS > 0 ? Math.max(0, Math.min(1, lastEnd / durationS)) : 0;
+  const duplicateRatio = duplicateLineRatioOf(result.segments.map((segment) => segment.text));
+  const verdict = repetitionVerdict("asr", duplicateRatio, options.allowRepetitive);
+  const warnings = verdict.warning ? [`${verdict.warning.gate}: ${verdict.warning.detail}`] : [];
+  for (const warning of warnings) context.ui.warn(`    ${warning}`);
 
   attempts.push({
     tier: 4,
@@ -363,6 +385,7 @@ async function runAsr(
     language: result.language,
     segments: result.segments,
     rawCaption: null,
+    warnings,
     // Record the checkpoint's own name (owner stripped), matching the spec's
     // example and pinning it with model_revision.
     model: modelRepo.split("/").pop() ?? modelRepo,

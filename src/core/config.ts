@@ -34,8 +34,17 @@ export const ConfigSchema = z.object({
   max_height: z.number().int().positive(),
   /** "auto" obeys the acquisition ladder; "best" skips machine captions. */
   quality: z.enum(["auto", "best"]),
-  /** Catalog name, explicit repo, or "none". */
+  /**
+   * Catalog name, explicit repo, or "none". The default is "none": setup must
+   * not pull a gigabyte of weights without being asked.
+   */
   asr_model: z.string().min(1),
+  /**
+   * Which yt-dlp to use. "auto" prefers the runtime-managed binary and falls
+   * back to a PATH install when the managed one is missing or cannot be
+   * downloaded; "managed" never falls back; "system" never downloads.
+   */
+  ytdlp: z.enum(["auto", "managed", "system"]).default("auto"),
   /** Concurrent ASR transcriptions. 1 keeps memory bounded. */
   parallel: z.number().int().positive(),
   /** Browser to pull cookies from for bot-check resilience; "" means none. */
@@ -54,9 +63,10 @@ export function defaultConfig(): Config {
     language: "en",
     max_height: 1080,
     quality: "auto",
-    asr_model: "turbo",
+    asr_model: "none",
     parallel: 1,
     browser: "",
+    ytdlp: "auto",
     ytdlp_channel: "stable",
     canary_urls: [...DEFAULT_CANARY_URLS],
   };
