@@ -105,9 +105,10 @@ export async function acquireTranscript(
   });
 
   if (plan.steps.length === 0) {
+    const skipped = plan.skipped.map((entry) => `tier ${entry.tier}: ${entry.reason}`).join("; ");
     throw noTranscriptError(
       `transcript for ${input.videoId}`,
-      "no acquisition tier is available: --no-asr removed the last one",
+      `no acquisition tier is available. ${skipped}`,
       "drop `--no-asr`, or add `--asr` to transcribe locally",
     );
   }
