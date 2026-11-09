@@ -13,7 +13,7 @@ import { noTranscriptError, qualityError, YtxError } from "../core/errors.ts";
 import { detectLanguage, type LanguageGuess } from "../captions/lang.ts";
 import { describeFailures, evaluateGates, type GateMetrics } from "../captions/gates.ts";
 import { normalizeTrack, segmentCues, type NormalizedTrack } from "../captions/normalize.ts";
-import { planLadder, resolvePreferredLanguage, type Availability, type LadderPlan } from "../captions/ladder.ts";
+import { planLadder, type Availability, type LadderPlan } from "../captions/ladder.ts";
 import { parseCaptions, toVtt, type ParsedCaptions } from "../captions/vtt.ts";
 import type { TranscriptSegment } from "../core/schema.ts";
 import type { CommandContext } from "./context.ts";
@@ -120,7 +120,7 @@ export async function acquireTranscript(
       if (step.source === "asr") {
         ui.note(`  tier 4 · transcribing locally`);
         const audio = await input.ensureAudio();
-        const acquired = await runAsr(context, input.videoId, audio, input.durationS, workRoot, attempts);
+        const acquired = await runAsr(context, audio, input.durationS, workRoot, attempts);
         if (acquired) {
           return { ...acquired, plan, attempts };
         }
@@ -281,7 +281,6 @@ async function fetchWithRetry(
 
 async function runAsr(
   context: AcquireContext,
-  videoId: string,
   audioPath: string,
   durationS: number,
   workRoot: string,

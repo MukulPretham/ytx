@@ -79,6 +79,17 @@ export class YtxError extends Error {
   }
 }
 
+/**
+ * Throw after a command has already emitted its result, so the process exit
+ * code is set without printing a second JSON document or a duplicate message.
+ */
+export class SilentExit extends Error {
+  constructor(readonly code: number) {
+    super("command finished with a non-zero status");
+    this.name = "SilentExit";
+  }
+}
+
 export function usageError(what: string, why: string, next: string): YtxError {
   return new YtxError({ what, why, next, code: EXIT.usage, kind: "usage" });
 }

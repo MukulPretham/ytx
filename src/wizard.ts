@@ -57,9 +57,10 @@ export function wizardDefaults(
 ): WizardChoices {
   return {
     library: context.library.root,
-    language: overrides.language ?? context.config.language ?? "en",
-    model: overrides.model ?? context.config.asr_model ?? DEFAULT_MODEL_NAME,
-    browser: overrides.browser ?? context.config.browser ?? "skip",
+    language: overrides.language || context.config.language || "en",
+    model: overrides.model || context.config.asr_model || DEFAULT_MODEL_NAME,
+    // An empty browser means "skip"; "" must not become a selected option.
+    browser: overrides.browser || context.config.browser || "skip",
     maxHeight: context.config.max_height,
   };
 }

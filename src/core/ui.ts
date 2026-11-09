@@ -22,6 +22,7 @@ export class Ui {
   readonly color: boolean;
   private readonly out: NodeJS.WriteStream;
   private readonly err: NodeJS.WriteStream;
+  private progressWidth = 0;
 
   constructor(options: UiOptions = {}) {
     this.json = options.json ?? false;
@@ -79,6 +80,25 @@ export class Ui {
     if (this.debug && error.cause instanceof Error && error.cause.stack) {
       this.err.write(`${error.cause.stack}\n`);
     }
+  }
+
+  /**
+   * Single-line progress for downloads. On a TTY it overwrites itself; on a
+   * pipe it stays silent, so logs and `--json` output are not flooded.
+   */
+  progress(label: string, fraction: number | null): void {
+    if (this.json || !this.err.isTTY) return;
+    const percent = fraction === null ? "" : ` ${Math.max(0, Math.min(100, Math.round(fraction * 100)))}%`;
+    const text = `${label}${percent}`;
+    const padded = text.padEnd(this.progressWidth, " ");
+    this.progressWidth = text.length;
+    this.err.write(`\r${padded}`);
+  }
+
+  progressDone(): void {
+    if (!this.err.isTTY || this.progressWidth === 0) return;
+    this.err.write(`\r${" ".repeat(this.progressWidth)}\r`);
+    this.progressWidth = 0;
   }
 
   /** Emit the command's machine-readable result. */

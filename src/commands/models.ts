@@ -11,6 +11,7 @@ import { EXIT, usageError, YtxError } from "../core/errors.ts";
 import { saveState } from "../core/state.ts";
 import { columns, formatAge, formatBytes } from "../core/ui.ts";
 import type { CommandContext } from "./context.ts";
+import { failAfterEmit } from "./context.ts";
 import { CATALOG, DEFAULT_MODEL_NAME, findCatalogEntry } from "../models/catalog.ts";
 import {
   addModel,
@@ -146,17 +147,14 @@ async function add(
       );
     },
     onProgress: (progress) => {
-      if (context.flags.json) return;
-      const percent =
-        progress.size && progress.size > 0
-          ? ` ${Math.min(100, Math.round((progress.received / progress.size) * 100))}%`
-          : "";
-      const size = progress.size ? ` of ${formatBytes(progress.size)}` : "";
-      writeProgress(`${progress.file}${percent}${size}`);
+      context.ui.progress(
+        `  ${progress.file}`,
+        progress.size && progress.size > 0 ? progress.received / progress.size : null,
+      );
     },
     canary: async (modelPath) => {
       if (!context.flags.json) {
-        clearProgress();
+        context.ui.progressDone();
         context.ui.note("running the canary transcription…");
       }
       return runCanary({
@@ -169,7 +167,7 @@ async function add(
     },
   });
 
-  clearProgress();
+  context.ui.progressDone();
 
   let isDefault = false;
   const currentDefault = context.state.default_model;
@@ -286,16 +284,20 @@ async function verify(
     }
   }
 
-  context.ui.emit({ results });
   if (problems > 0) {
-    throw new YtxError({
-      what: "models verify",
-      why: `${problems} model(s) failed verification`,
-      next: "reinstall them with `ytx models add`, or remove them with `ytx models rm`",
-      code: EXIT.integrity,
-      kind: "model-invalid",
-    });
+    failAfterEmit(
+      context,
+      { results },
+      new YtxError({
+        what: "models verify",
+        why: `${problems} model(s) failed verification`,
+        next: "reinstall them with `ytx models add`, or remove them with `ytx models rm`",
+        code: EXIT.integrity,
+        kind: "model-invalid",
+      }),
+    );
   }
+  context.ui.emit({ results });
 }
 
 function setDefault(context: CommandContext, positionals: string[]): void {
@@ -341,21 +343,6 @@ function showPath(context: CommandContext, positionals: string[]): void {
     manifest: resolved.manifest,
     default: resolved.name === effectiveDefault(context.state.default_model),
   });
-}
-
-let lastProgressWidth = 0;
-
-function writeProgress(text: string): void {
-  if (!process.stderr.isTTY) return;
-  const padded = text.padEnd(lastProgressWidth, " ");
-  lastProgressWidth = text.length;
-  process.stderr.write(`\r${padded}`);
-}
-
-function clearProgress(): void {
-  if (!process.stderr.isTTY || lastProgressWidth === 0) return;
-  process.stderr.write(`\r${" ".repeat(lastProgressWidth)}\r`);
-  lastProgressWidth = 0;
 }
 
 function truncate(text: string, width: number): string {

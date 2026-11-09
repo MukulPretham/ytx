@@ -5,7 +5,7 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { defaultConfig, loadConfig, saveConfig, type Config } from "../core/config.ts";
-import { usageError } from "../core/errors.ts";
+import { SilentExit, usageError, type YtxError } from "../core/errors.ts";
 import { resolvePaths, type LibraryPaths, type Paths, type RuntimePaths } from "../core/paths.ts";
 import { loadState, type State } from "../core/state.ts";
 import { Ui } from "../core/ui.ts";
@@ -83,6 +83,23 @@ export function requireFfmpeg(context: CommandContext): string {
     );
   }
   return path;
+}
+
+/**
+ * Finish with a failure after a command has produced its result.
+ *
+ * `--json` consumers get one document: the payload plus an `error` field. Human
+ * consumers get the usual three-part message. Either way the exit code is the
+ * error's code and nothing is printed twice.
+ */
+export function failAfterEmit(
+  context: CommandContext,
+  payload: Record<string, unknown>,
+  error: YtxError,
+): never {
+  if (context.flags.json) context.ui.emit({ ...payload, error: error.toJSON() });
+  context.ui.printError(error);
+  throw new SilentExit(error.code);
 }
 
 /** Create the library skeleton without touching existing data. */

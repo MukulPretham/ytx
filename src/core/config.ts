@@ -22,7 +22,7 @@ export const CONFIG_SCHEMA = 1;
  */
 export const DEFAULT_CANARY_URLS = [
   "https://www.youtube.com/watch?v=jNQXAC9IVRw",
-  "https://www.youtube.com/watch?v=BaW_jenozKc",
+  "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
   "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
 ] as const;
 

@@ -188,7 +188,7 @@ export function planLadder(
 export function tracksFor(map: TrackMap, language: string): string[] {
   const wanted = normalizeLangTag(language);
   const candidates = Object.keys(map).filter((key) => normalizeLangTag(key) === wanted);
-  return orderTrackKeys(candidates, wanted);
+  return orderTrackKeys(candidates);
 }
 
 export function otherHumanLanguages(
@@ -211,16 +211,12 @@ export function otherHumanLanguages(
   return keys.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
 }
 
-function orderTrackKeys(keys: string[], wanted: string): string[] {
-  const hasVtt = (key: string) => key !== "";
-  return [...keys].sort((a, b) => {
-    const score = (key: string): number => {
-      let value = 0;
-      if (normalizeLangTag(key) === key) value -= 2; // exact `en` over `en-US`
-      if (/-orig$/i.test(key)) value -= 1;
-      if (!hasVtt(key)) value += 1;
-      return value;
-    };
-    return score(a) - score(b) || a.localeCompare(b);
-  });
+/** Exact tags beat regional variants; `-orig` beats other variants. */
+function orderTrackKeys(keys: string[]): string[] {
+  const score = (key: string): number => {
+    if (normalizeLangTag(key) === key) return 0; // exact `en` before `en-US`
+    if (/-orig$/i.test(key)) return 1;
+    return 2;
+  };
+  return [...keys].sort((a, b) => score(a) - score(b) || a.localeCompare(b));
 }

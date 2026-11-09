@@ -7,7 +7,7 @@
  * user's own `~/.config/yt-dlp/config` must not change this tool's behaviour.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { fetchError, YtxError } from "../core/errors.ts";
@@ -237,23 +237,6 @@ export async function rollbackYtdlp(runtime: RuntimePaths): Promise<{ version: s
 
   writeVersionFile(runtime, previousVersion);
   return { version: previousVersion, previous: currentVersion };
-}
-
-/** Human-readable size of the installed binary, for `doctor`. */
-export function binarySize(path: string): number | null {
-  try {
-    return statSync(path).size;
-  } catch {
-    return null;
-  }
-}
-
-export function readVersionFile(runtime: RuntimePaths): string | null {
-  try {
-    return readFileSync(join(runtime.bin, "yt-dlp.version"), "utf8").trim();
-  } catch {
-    return null;
-  }
 }
 
 function writeVersionFile(runtime: RuntimePaths, version: string): void {

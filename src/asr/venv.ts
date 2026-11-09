@@ -133,7 +133,7 @@ export async function installUv(runtime: RuntimePaths, onLine?: (line: string) =
       "install uv yourself and rerun `ytx setup`",
     );
   }
-  renameSync(binary, runtime.bin + "/uv");
+  renameSync(binary, join(runtime.bin, "uv"));
   chmodSync(join(runtime.bin, "uv"), 0o755);
   rmSync(extracted, { recursive: true, force: true });
   rmSync(archive, { force: true });

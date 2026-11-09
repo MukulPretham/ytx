@@ -5,23 +5,25 @@
  * and only fills the gaps, and a component is either fully installed or absent.
  */
 
-import { chmodSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_CANARY_URLS, defaultConfig, saveConfig } from "../core/config.ts";
-import { EXIT, asYtxError, fetchError, usageError, YtxError } from "../core/errors.ts";
+import { EXIT, asYtxError, fetchError, YtxError } from "../core/errors.ts";
 import { readAllMeta } from "../core/record.ts";
-import { loadState, saveState } from "../core/state.ts";
+import { videoDir } from "../core/paths.ts";
+import { saveState } from "../core/state.ts";
 import { columns, formatBytes } from "../core/ui.ts";
 import type { CommandContext, GlobalFlags } from "./context.ts";
-import { resolveFfmpegPath } from "./context.ts";
-import { effectiveDefault, listInstalled, modelsRoot, verifyModel } from "../models/manager.ts";
-import { CATALOG, DEFAULT_MODEL_NAME, findCatalogEntry, modelDirName } from "../models/catalog.ts";
+import { failAfterEmit, resolveFfmpegPath } from "./context.ts";
+import { effectiveDefault, listInstalled, verifyModel } from "../models/manager.ts";
+import { modelDirName } from "../models/catalog.ts";
 import { ensureVenv, findUv, installUv, uvVersionSync, venvStatus } from "../asr/venv.ts";
 import { installYtdlp, rollbackYtdlp, ytdlpVersion } from "../ytdlp/binary.ts";
 import { fetchInfo } from "../ytdlp/run.ts";
-import { formatClock, provenanceCounts } from "./render.ts";
+import { provenanceCounts } from "./render.ts";
 import { runWizard, wizardDefaults, type WizardChoices } from "../wizard.ts";
-import { cmdModels } from "./models.ts";
+import { addModel } from "../models/manager.ts";
+import { runCanary } from "../asr/transcribe.ts";
 import { acquireLock } from "../core/lock.ts";
 
 /* ------------------------------------------------------------------ setup */
@@ -114,11 +116,10 @@ export async function applySetup(
       ui.note("installing yt-dlp…");
       const result = await installYtdlp(context.runtime, config.ytdlp_channel, {
         onProgress: (progress) => {
-          if (!ui.json && progress.total) {
-            ui.note(`  ${Math.round((progress.received / progress.total) * 100)}%`);
-          }
+          ui.progress("  yt-dlp", progress.total ? progress.received / progress.total : null);
         },
       });
+      ui.progressDone();
       context.state.ytdlp = {
         version: result.version,
         channel: config.ytdlp_channel,
@@ -182,13 +183,28 @@ export async function applySetup(
     } else {
       try {
         ui.note(`installing model ${choices.model}…`);
-        await cmdModels(
-          context,
-          "add",
-          [choices.model],
-          { json: false, noDefault: false, yes: true, canary: true },
-        );
-        steps.push({ name: "model", status: "installed", detail: choices.model });
+        const added = await addModel(context.runtime, choices.model, {
+          onUntested: (repo) =>
+            ui.warn(`${repo} is not in the tested catalog; it will be canaried, but quality is unverified`),
+          onProgress: (progress) => {
+            ui.progress(`  ${progress.file}`, progress.size ? progress.received / progress.size : null);
+          },
+          canary: async (modelPath) => {
+            ui.note("  running the canary transcription…");
+            return runCanary({
+              runtime: context.runtime,
+              ffmpeg: context.ffmpeg,
+              modelPath,
+              modelName: choices.model,
+              onLine: context.flags.debug ? (line) => ui.note(`    ${line}`) : undefined,
+            });
+          },
+        });
+        ui.progressDone();
+        context.state.default_model = added.name;
+        saveState(context.runtime.state, context.state);
+        steps.push({ name: "model", status: "installed", detail: added.name });
+        ui.ok(`installed model ${added.name} (${added.manifest.repo}@${added.manifest.revision.slice(0, 8)})`);
       } catch (err) {
         const error = asYtxError(err, `install model ${choices.model}`, "rerun `ytx setup` to resume");
         errors.push(error);
@@ -371,8 +387,7 @@ export async function cmdUpdate(context: CommandContext, flags: UpdateFlags): Pr
     context.ui.note(`downloading yt-dlp (${channel})…`);
     const result = await installYtdlp(context.runtime, channel, {
       onProgress: (progress) => {
-        if (context.flags.json || !progress.total) return;
-        context.ui.note(`  ${Math.round((progress.received / progress.total) * 100)}%`);
+        context.ui.progress("  yt-dlp", progress.total ? progress.received / progress.total : null);
       },
       canary: flags.force
         ? undefined
@@ -396,6 +411,7 @@ export async function cmdUpdate(context: CommandContext, flags: UpdateFlags): Pr
           },
     });
 
+    context.ui.progressDone();
     context.state.ytdlp = {
       version: result.version,
       channel,
@@ -577,6 +593,26 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
     push("library", `record ${entry.id}`, false, entry.error.why, entry.error.next);
   }
 
+  let missingFiles = 0;
+  for (const record of records) {
+    const dir = videoDir(context.library, record.id);
+    const missing = [record.media.video, record.media.audio, record.media.mp3].filter(
+      (name): name is string => typeof name === "string" && !existsSync(join(dir, name)),
+    );
+    if (missing.length === 0) continue;
+    missingFiles += 1;
+    push(
+      "library",
+      `media ${record.id}`,
+      false,
+      `missing ${missing.join(", ")}`,
+      `re-add with \`ytx add --force ${record.url}\`, or \`ytx retry\` if it is queued`,
+    );
+  }
+  if (records.length > 0 && missingFiles === 0) {
+    push("library", "media files", true, "every recorded media file is present");
+  }
+
   const queueEntries = existsSync(context.library.queue)
     ? (await import("../core/queue.ts")).readQueue(context.library)
     : [];
@@ -646,30 +682,32 @@ export function printDoctor(context: CommandContext, report: DoctorReport): void
 export async function cmdDoctor(context: CommandContext): Promise<void> {
   const report = await doctorReport(context);
   if (!context.flags.json) printDoctor(context, report);
-  context.ui.emit(report);
 
-  const fatal = report.problems.some((problem) =>
-    /dependencies\/yt-dlp|library\/record |library\/config|models\//.test(problem.name),
+  // Broken records and missing media files are both store integrity problems.
+  const brokenRecords = report.problems.filter(
+    (problem) => problem.name.startsWith("library/record ") || problem.name.startsWith("library/media "),
   );
-  const integrity = report.problems.some((problem) => problem.name.startsWith("library/record "));
-  if (integrity) {
-    throw new YtxError({
+  if (brokenRecords.length > 0) {
+    failAfterEmit(context, { ...report }, new YtxError({
       what: "doctor",
-      why: `${report.problems.filter((problem) => problem.name.startsWith("library/record ")).length} record(s) failed validation`,
+      why: `${brokenRecords.length} integrity problem(s) in the library`,
       next: "fix or re-add the records named above; `ytx list --json` still shows the valid ones",
       code: EXIT.integrity,
       kind: "integrity",
-    });
+    }));
   }
+
+  const fatal = report.problems.some((problem) =>
+    /^dependencies\/|^models\/|^library\/config/.test(problem.name),
+  );
   if (fatal) {
-    throw new YtxError({
+    failAfterEmit(context, { ...report }, new YtxError({
       what: "doctor",
       why: "a required component is missing",
       next: report.problems[0]?.fix ?? "run `ytx setup`",
       code: EXIT.fetch,
       kind: "dependency",
-    });
+    }));
   }
+  context.ui.emit(report);
 }
-
-export { CATALOG, DEFAULT_MODEL_NAME, findCatalogEntry, loadState, formatClock };

@@ -92,21 +92,6 @@ export async function run(
   };
 }
 
-/** Run and throw on a non-zero exit, keeping both streams in the message. */
-export async function runChecked(
-  command: string,
-  args: readonly string[],
-  label: string,
-  options: RunOptions = {},
-): Promise<RunResult> {
-  const result = await run(command, args, options);
-  if (result.code !== 0) {
-    const detail = lastLines(result.stderr || result.stdout, 8);
-    throw new Error(`${label} exited ${result.code}${detail ? `: ${detail}` : ""}`);
-  }
-  return result;
-}
-
 export function lastLines(text: string, count: number): string {
   return text
     .split("\n")

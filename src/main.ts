@@ -8,7 +8,7 @@
  */
 
 import { parseArgs } from "node:util";
-import { EXIT, YtxError, usageError } from "./core/errors.ts";
+import { EXIT, SilentExit, YtxError, usageError } from "./core/errors.ts";
 import { buildContext, type GlobalFlags, type CommandContext } from "./commands/context.ts";
 import {
   cmdAdd,
@@ -165,6 +165,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     await dispatch(command, context, parsed, global);
     return EXIT.ok;
   } catch (err) {
+    if (err instanceof SilentExit) return err.code;
     const error = toYtxError(err, command);
     if (global.json) {
       context.ui.emit({ error: error.toJSON() });

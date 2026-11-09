@@ -33,7 +33,7 @@ import { columns, formatBytes, formatDuration } from "../core/ui.ts";
 import { chapterLines, formatClock, mediaLine, provenanceLine, snippet } from "./render.ts";
 import { acquireTranscript, acquisitionOptions } from "./acquisition.ts";
 import type { CommandContext } from "./context.ts";
-import { ensureLibrary, requireFfmpeg } from "./context.ts";
+import { ensureLibrary, failAfterEmit, requireFfmpeg } from "./context.ts";
 import { downloadMedia, fetchInfo, type YtdlpRawInfo } from "../ytdlp/run.ts";
 import { acquireLock } from "../core/lock.ts";
 
@@ -125,6 +125,8 @@ export async function cmdAdd(
       if (!target) return;
       try {
         await addOne(context, target.url, target.id, flags);
+        // Success clears any pending retry for this video.
+        removeFromQueue(context.library, target.id);
         acquired.push(target.id);
       } catch (err) {
         const error = asYtxError(err, `add ${target.id}`, "see the message above");
@@ -152,14 +154,10 @@ export async function cmdAdd(
   });
   await Promise.all(workers);
 
-  context.ui.emit({ added: acquired, failed: failures.map((error) => error.toJSON()) });
-
-  if (failures.length > 0 && acquired.length === 0) {
-    throw failures[0]!;
-  }
   if (failures.length > 0) {
-    throw failures[0]!;
+    failAfterEmit(context, { added: acquired, failed: failures.map((error) => error.toJSON()) }, failures[0]!);
   }
+  context.ui.emit({ added: acquired, failed: [] });
 }
 
 async function addOne(
@@ -593,8 +591,20 @@ export async function cmdRetry(
   for (const entry of entries.slice(0, flags.limit)) {
     context.ui.note(`retrying ${entry.id} (${entry.stage})…`);
     try {
-      const meta = readMeta(context.library, entry.id);
+      if (entry.stage === "add") {
+        // The queue records "this video still needs archiving". If it is
+        // archived now, the work is done - re-downloading it would only spend
+        // quota to reach the same state.
+        const archived = tryReadMeta(context.library, entry.id);
+        if (archived.ok && archived.meta.media.audio !== null) {
+          removeFromQueue(context.library, entry.id);
+          retried.push(entry.id);
+          context.ui.ok(`${entry.id} was archived by an earlier run; removed from the queue`);
+          continue;
+        }
+      }
       if (entry.stage === "media") {
+        const meta = readMeta(context.library, entry.id);
         await downloadAndAttachMedia(context, meta, entry.url, { maxHeight: context.config.max_height });
       } else {
         await addOne(context, canonicalWatchUrl(entry.id), entry.id, {
@@ -621,16 +631,21 @@ export async function cmdRetry(
     }
   }
 
-  context.ui.emit({ retried, failed, remaining: readQueue(context.library).length });
+  const payload = { retried, failed, remaining: readQueue(context.library).length };
   if (failed.length > 0 && retried.length === 0) {
-    throw new YtxError({
-      what: "retry",
-      why: `${failed.length} item(s) still failing`,
-      next: "see the message above; transient failures stay queued with a backoff",
-      code: EXIT.fetch,
-      kind: "retry-failed",
-    });
+    failAfterEmit(
+      context,
+      payload,
+      new YtxError({
+        what: "retry",
+        why: `${failed.length} item(s) still failing`,
+        next: "see the message above; transient failures stay queued with a backoff",
+        code: EXIT.fetch,
+        kind: "retry-failed",
+      }),
+    );
   }
+  context.ui.emit(payload);
 }
 
 export function defaultAddFlags(context: CommandContext): AddFlags {
@@ -747,7 +762,7 @@ export async function cmdPrune(
   });
 }
 
-export async function cmdSync(context: CommandContext, positionals: string[]): Promise<void> {
+export async function cmdSync(_context: CommandContext, positionals: string[]): Promise<void> {
   void positionals;
   throw new YtxError({
     what: "sync",
