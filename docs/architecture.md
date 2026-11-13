@@ -28,7 +28,7 @@ It is never copied between machines and is fully rebuilt by `ytx setup`.
 <library>/                  # ~/.ytx/library, or --store/YTX_HOME/.ytx marker
   config.toml
   queue.jsonl
-  videos/<videoId>/
+  videos/<id>/              # an 11-char YouTube id, or local-<12 hex> from a file's SHA-256
     meta.json
     <videoId>.mp4           # muxed video with audio
     <videoId>.m4a           # the original audio track, kept as-is
@@ -37,6 +37,9 @@ It is never copied between machines and is fully rebuilt by `ytx setup`.
     transcript.json
     transcript.txt
 ```
+
+Imports also stage under `videos/.incoming-*` while they run. The leading dot
+keeps them out of every listing, and `prune` sweeps one left by a killed process.
 
 The rule that keeps them apart: **every path inside `meta.json` is relative to
 the video directory.** A record never names the runtime, never names an absolute
@@ -94,7 +97,8 @@ transcript record stays in history.
 
 ## Acquisition ladder
 
-The first tier that passes the gates wins.
+The first tier that passes the gates wins. A local import has no caption tiers at
+all: tier 4 is the whole ladder, and `--no-asr` does not exist on `ytx import`.
 
 1. human captions in the preferred language
 2. human captions in another language (the actual language is recorded)
@@ -179,6 +183,12 @@ ASR audio downloaded into staging is moved into the video directory only when
 media will be archived too, so `--transcript-only` records have no unrecorded
 media files.
 
+An import stages in `videos/.incoming-*`, inside the library so the publish is a
+rename on one filesystem rather than a second copy across devices. The
+transcript is written into that staging directory and `meta.json` is moved last,
+so the record never points at files that are not there yet. A killed import
+leaves only a dot directory, invisible to `list`, which `prune` removes.
+
 ## Setup downloads no weights by default
 
 `asr_model` defaults to `"none"`. Weights are installed only by:
@@ -213,6 +223,39 @@ the original. Nothing transcodes the original away.
 If the mp4 mux fails, the separate streams are kept and the failure is reported.
 If the video stream is unavailable, the add degrades to audio-only rather than
 failing: the transcript is the point.
+
+## Local files
+
+`ytx import <path>` brings an existing file into the same record shape. It is a
+separate command so neither command has to guess what its argument is.
+
+- **Identity is content, not a path.** `id = "local-" + sha256(bytes)[0..12]`.
+  The hash is computed while the file is copied, so a multi-gigabyte file is
+  read once. Re-importing the same bytes resolves to the same directory and
+  reports `already archived`; `--force` re-transcribes it and appends to
+  `transcript_history`.
+- **The source is copied, never referenced.** The library stays pure data: an
+  absolute path never enters `meta.json`. The original filename survives as a
+  basename in `source.filename`, and `url` is `local:sha256:<full digest>`.
+- **No yt-dlp and no queue.** Import fails with a usage, fetch or transcript
+  error; it never writes `queue.jsonl`, whose retry contract is URL-shaped.
+- **Only `asr` provenance.** Embedded and sidecar subtitle tracks are ignored in
+  this build; importing them would require deciding whether a file of unknown
+  origin counts as human or machine captions.
+- **Media mapping.** The video stream is kept byte-for-byte in the source
+  container. The audio is remuxed to `.m4a`/`.mp3`/`.opus`/`.ogg`/`.flac` when
+  the codec fits a lossless container and transcoded to AAC otherwise. An
+  audio-only input is its own audio track, so nothing is extracted. An mp3
+  source needs no generated mp3. A file with no audio stream exits `4` before
+  anything is written.
+- **Prerequisites.** `ffmpeg`, `ffprobe`, an installed model and a working venv,
+  all checked before the first byte is copied. `ffprobe` is the authority on
+  streams, duration, chapters and tags; the extension is not consulted.
+
+A local record carries `schema: 2` and `origin: "file"` with a `source` block.
+The schema ties the id to the hash and the url to the hash, so a hand-edited id
+is refused. YouTube records keep `schema: 1` and validate unchanged; `origin`
+defaults to `"youtube"` on read.
 
 ## Downloader resolution and the GitHub fallback
 
@@ -263,7 +306,7 @@ PyTorch or GGUF checkpoint gets the likely MLX equivalent named.
 
 | dependency | why it is here, and why not something else |
 | --- | --- |
-| `@clack/prompts` | the first-run wizard needs real prompts with defaults and a cancel path. It is the only interactive dependency and is used only by the wizard. |
+| `@clack/prompts` | setup and the first `ytx format` need real prompts with defaults and a cancel path. It is the only interactive dependency; `src/prompts.ts` owns the export-folder question shared by both. |
 | `zod` | `meta.json`, `config.toml`, `state.json`, `queue.jsonl`, and `transcript.json` all have contracts. Hand-written guards drift; one schema per record is also the error message ("duration_s: Expected number"). |
 | `smol-toml` | config is read and written as TOML, so a human can edit it. |
 | Bun `util.parseArgs` | flag parsing is not worth a framework: the surface is small and hierarchy-free. |
@@ -274,9 +317,9 @@ PyTorch or GGUF checkpoint gets the likely MLX equivalent named.
 
 ## Command surface
 
-`init`, `setup`, `update`, `doctor`, `add`, `transcript`, `show`, `list`,
-`search`, `retry`, `rm`, `prune`, `models`, and `sync` (which exits `2` and says
-it is not implemented in v1).
+`init`, `setup`, `update`, `doctor`, `add`, `import`, `format`, `transcript`,
+`show`, `list`, `search`, `retry`, `rm`, `prune`, `models`, and `sync` (which
+exits `2` and says it is not implemented in v1).
 
 `--quality` is accepted but no longer changes the plan: platform machine
 captions are not acquired. `caption-auto` records remain readable and
@@ -288,6 +331,9 @@ Notable flag surface:
 add        --max-height --language --quality auto|best --asr --no-asr
            --strict-lang --allow-repetitive --parallel --cookies-from-browser
            --force --no-media|--transcript-only
+import     --language --title --allow-repetitive --parallel --force
+           --no-media|--transcript-only
+format     <id|url> [txt|md|srt|vtt|json|all] --timestamps --dir <path>
 transcript <url|id> --format txt|json|srt|vtt|md --timestamps --language --asr
 show       <id> --format --timestamps --raw --history
 list       --source --missing-transcript --missing-media --sort --limit
@@ -310,13 +356,26 @@ store integrity error, `130` interrupted.
 `ytx transcript <url>` fetches and prints without writing; `ytx transcript <id>`
 reads the store. `ytx add --force` is the way to replace an archived transcript.
 
+`ytx format` is the only command that writes outside the library. The folder is
+`export_dir` from `config.toml`; a relative value is resolved against the
+library root, and `--dir` overrides it per run. An empty key means "not asked
+yet": an interactive run prompts (suggesting `~/Desktop/ytx-transcripts`),
+creates the folder, saves the answer, and continues with the same export; a
+non-interactive run exits `2` rather than picking a folder. `ytx setup` asks the
+same question and `setup --export-dir` answers it for scripts. Each record
+exports into `<root>/<title> (<id>)/`, with files named `<title> (<id>).<ext>`, so
+two records with the same title cannot mix.
+
 ## Testing
 
 `bun test` covers the pure logic only, with no network: caption parsing and
 normalization (including rolling-window collapse), the source-aware quality
 gates, path resolution and URL parsing, language detection, ladder planning,
 record schema and transcript validation, config round-trips, failure
-classification, queue backoff, the model catalog, and manifest validation.
+classification, queue backoff, the model catalog, and manifest validation. Local
+imports add path resolution, ffprobe JSON parsing, the audio-container mapping,
+hashing/copying, staging publish, and the local-record schema rules. Export adds
+the folder-name rules, export-dir resolution and the home-relative config form.
 
 Everything that touches the network or a Python process is verified by hand
 against live videos; that evidence lives in the task record, not in `bun test`.

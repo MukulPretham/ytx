@@ -6,16 +6,17 @@
  */
 
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CANARY_URLS, defaultConfig, saveConfig } from "../core/config.ts";
 import { EXIT, asYtxError, fetchError, usageError, YtxError } from "../core/errors.ts";
 import { TRANSCRIPT_JSON, TRANSCRIPT_TXT, listVideoIds, readAllMeta, readTranscript, renderTranscriptText } from "../core/record.ts";
-import { videoDir } from "../core/paths.ts";
+import { resolveExportDir, videoDir } from "../core/paths.ts";
 import { isProcessAlive, readLock } from "../core/lock.ts";
 import { saveState } from "../core/state.ts";
 import { columns, formatBytes } from "../core/ui.ts";
 import type { CommandContext, GlobalFlags } from "./context.ts";
-import { failAfterEmit, resolveFfmpegPath } from "./context.ts";
+import { failAfterEmit, resolveFfmpegPath, resolveFfprobePath } from "./context.ts";
 import { configuredModel, listInstalled, verifyModel } from "../models/manager.ts";
 import { modelDirName } from "../models/catalog.ts";
 import { ensureVenv, findUv, installUv, uvVersionSync, venvStatus } from "../asr/venv.ts";
@@ -36,6 +37,8 @@ export interface SetupFlags {
   /** Deprecated alias for --with-model, kept so old scripts keep working. */
   model?: string;
   browser?: string;
+  /** Where `ytx format` writes; omitted means leave the key alone. */
+  exportDir?: string;
   force: boolean;
 }
 
@@ -52,7 +55,7 @@ export async function cmdSetup(
     ? await runWizard({ context, defaults: wizardDefaults(context) })
     : wizardDefaults(context, { ...flags, model: flags.withModel ?? flags.model });
 
-  if (!interactive && (flags.language || flags.withModel || flags.model || flags.browser)) {
+  if (!interactive && (flags.language || flags.withModel || flags.model || flags.browser || flags.exportDir)) {
     context.ui.note("using the flags you passed; no prompt was shown");
   }
 
@@ -114,11 +117,44 @@ export async function applySetup(
     language: choices.language,
     asr_model: choices.model,
     browser: choices.browser === "skip" ? "" : choices.browser,
+    export_dir: choices.exportDir,
     max_height: choices.maxHeight ?? context.config.max_height,
   };
   saveConfig(context.library, config);
   context.config = config;
   steps.push({ name: "config", status: "present", detail: context.library.config });
+
+  // Exports are optional until the first `ytx format`, but an answer from the
+  // wizard (or --export-dir) is created now so the first export cannot fail on
+  // a typo that was already accepted.
+  if (choices.exportDir.trim() !== "") {
+    const exportPath =
+      resolveExportDir({
+        configValue: choices.exportDir,
+        libraryRoot: context.library.root,
+        home: homedir(),
+      }) ?? choices.exportDir;
+    try {
+      mkdirSync(exportPath, { recursive: true });
+      steps.push({ name: "exports", status: "present", detail: exportPath });
+      ui.ok(`exports ${exportPath}`);
+    } catch (err) {
+      const error = fetchError(
+        "export folder",
+        `${exportPath} cannot be created (${(err as NodeJS.ErrnoException).code ?? "unknown error"})`,
+        "choose another folder with `ytx setup --export-dir <path>`",
+      );
+      errors.push(error);
+      steps.push({ name: "exports", status: "failed", detail: error.why });
+      ui.fail(`exports: ${error.why}`);
+    }
+  } else {
+    steps.push({
+      name: "exports",
+      status: "skipped",
+      detail: "not set; the first `ytx format` asks",
+    });
+  }
 
   // yt-dlp: managed in the runtime directory, or a PATH binary, per config.
   const ytdlpMode = config.ytdlp;
@@ -199,8 +235,20 @@ export async function applySetup(
   // ffmpeg: PATH first, otherwise a static build into the runtime directory.
   try {
     const ffmpeg = await ensureFfmpeg(context);
-    steps.push({ name: "ffmpeg", status: ffmpeg.status, detail: `${ffmpeg.version} (${ffmpeg.source})` });
-    ui.ok(`ffmpeg ${ffmpeg.version} (${ffmpeg.source === "path" ? "on PATH" : context.runtime.ffmpeg})`);
+    const ffprobe = resolveFfprobePath(context.runtime);
+    const ffprobeVersion = existsSync(ffprobe) ? await probeVersion(ffprobe) : null;
+    const ffprobeDetail = ffprobeVersion ? ` · ffprobe ${ffprobeVersion}` : " · ffprobe missing";
+    steps.push({
+      name: "ffmpeg",
+      status: ffmpeg.status,
+      detail: `${ffmpeg.version} (${ffmpeg.source})${ffprobeDetail}`,
+    });
+    ui.ok(
+      `ffmpeg ${ffmpeg.version} (${ffmpeg.source === "path" ? "on PATH" : context.runtime.ffmpeg})${ffprobeDetail}`,
+    );
+    if (ffprobeVersion === null) {
+      ui.warn("ffprobe is missing; `ytx import` needs it. Re-run `ytx setup`, or install ffprobe beside ffmpeg");
+    }
   } catch (err) {
     const error = asYtxError(err, "install ffmpeg", "install ffmpeg yourself and rerun `ytx setup`");
     errors.push(error);
@@ -362,7 +410,8 @@ export async function downloadStaticFfmpeg(runtime: { bin: string; tmp: string; 
     await downloadTo(ffprobeUrl, join(runtime.bin, "ffprobe"));
     chmodSync(join(runtime.bin, "ffprobe"), 0o755);
   } catch {
-    // ffprobe is a nice-to-have: height reporting degrades gracefully without it.
+    // Setup continues: `add` only loses height reporting without it. But
+    // `ytx import` cannot run, so `doctor` names it and setup warns.
   }
   return version;
 }
@@ -402,7 +451,7 @@ async function probeVersion(binary: string): Promise<string | null> {
   const result = await run(binary, ["-version"], { timeoutMs: 20_000 });
   if (result.code !== 0) return null;
   const first = result.stdout.split("\n")[0] ?? "";
-  const match = /ffmpeg version (\S+)/.exec(first);
+  const match = /ff(?:mpeg|probe) version (\S+)/.exec(first);
   return match?.[1] ?? first.trim() ?? null;
 }
 
@@ -821,6 +870,16 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
     ffmpegVersion ? null : "run `ytx setup`",
   );
 
+  const ffprobePath = resolveFfprobePath(context.runtime);
+  const ffprobeVersion = existsSync(ffprobePath) ? await probeVersion(ffprobePath) : null;
+  push(
+    "dependencies",
+    "ffprobe",
+    ffprobeVersion !== null,
+    ffprobeVersion ? `${ffprobeVersion} (${ffprobePath})` : "not installed (needed by `ytx import`)",
+    ffprobeVersion ? null : "run `ytx setup`, or install ffprobe beside ffmpeg",
+  );
+
   const uv = findUv(context.runtime);
   const uvNeeded = wantedModel !== "none";
   push(
@@ -851,6 +910,19 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
   } catch (err) {
     push("library", "config.toml", false, (err as Error).message, "delete it and run `ytx setup`");
   }
+  const exportValue = context.config.export_dir.trim();
+  push(
+    "library",
+    "exports",
+    true,
+    exportValue === ""
+      ? "not set yet; the first `ytx format` asks"
+      : (resolveExportDir({
+          configValue: exportValue,
+          libraryRoot: context.library.root,
+          home: homedir(),
+        }) ?? exportValue),
+  );
 
   // Models
   const installed = listInstalled(context.runtime);
@@ -917,7 +989,9 @@ export async function doctorReport(context: CommandContext): Promise<DoctorRepor
       `media ${record.id}`,
       false,
       `missing ${missing.join(", ")}`,
-      `re-add with \`ytx add --force ${record.url}\`, or \`ytx retry\` if it is queued`,
+      record.origin === "file"
+        ? "the source path is not stored in the library; re-import it with `ytx import <path> --force`"
+        : `re-add with \`ytx add --force ${record.url}\`, or \`ytx retry\` if it is queued`,
     );
   }
   if (records.length > 0 && missingFiles === 0) {
@@ -1008,7 +1082,7 @@ export async function cmdDoctor(context: CommandContext, flags: { fix: boolean }
     failAfterEmit(context, { ...report }, new YtxError({
       what: "doctor",
       why: `${brokenRecords.length} integrity problem(s) in the library`,
-      next: "fix or re-add the records named above; `ytx list --json` still shows the valid ones",
+      next: "fix the broken records named above, or archive them again; `ytx list --json` still shows the valid ones",
       code: EXIT.integrity,
       kind: "integrity",
     }));

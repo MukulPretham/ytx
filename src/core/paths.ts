@@ -10,7 +10,7 @@
 
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 
 export interface Env {
   [key: string]: string | undefined;
@@ -32,6 +32,8 @@ export interface RuntimePaths {
   ytdlpPrev: string;
   /** Downloaded static ffmpeg, when the machine had none on PATH. */
   ffmpeg: string;
+  /** Downloaded static ffprobe, used by `import` and media probing. */
+  ffprobe: string;
   venv: string;
   venvPython: string;
   models: string;
@@ -113,6 +115,7 @@ export function resolveRuntimePaths(inputs: PathInputs = {}): RuntimePaths {
     ytdlp: join(root, "bin", "yt-dlp"),
     ytdlpPrev: join(root, "bin", "yt-dlp.prev"),
     ffmpeg: join(root, "bin", "ffmpeg"),
+    ffprobe: join(root, "bin", "ffprobe"),
     venv: join(root, "venv"),
     venvPython: join(root, "venv", "bin", "python"),
     models,
@@ -148,6 +151,47 @@ export function videoDir(library: LibraryPaths, videoId: string): string {
   return join(library.videos, videoId);
 }
 
+/** Expand `~` and resolve against `cwd`; used for `--dir` and import paths. */
+export function expandUserPath(input: string, inputs: { cwd: string; home: string }): string {
+  let raw = input.trim();
+  if (raw === "~") raw = inputs.home;
+  else if (raw.startsWith("~/")) raw = join(inputs.home, raw.slice(2));
+  return isAbsolute(raw) ? resolve(raw) : resolve(inputs.cwd, raw);
+}
+
+/** The path suggested the first time `ytx format` asks. */
+export function defaultExportDir(home: string): string {
+  return join(home, "Desktop", "ytx-transcripts");
+}
+
+/**
+ * The folder `ytx format` writes into. `null` means "not configured yet": the
+ * caller asks and saves the answer. A relative value is resolved against the
+ * library root so a copied library keeps it.
+ */
+export function resolveExportDir(input: {
+  configValue: string;
+  libraryRoot: string;
+  home: string;
+  cwd?: string;
+}): string | null {
+  const raw = input.configValue.trim();
+  if (raw === "") return null;
+  if (raw === "~") return input.home;
+  if (raw.startsWith("~/")) return join(input.home, raw.slice(2));
+  if (isAbsolute(raw)) return resolve(raw);
+  return resolve(input.libraryRoot, raw);
+}
+
+/** The form stored in config.toml: home-relative when possible, else absolute. */
+export function toConfigPath(path: string, home: string): string {
+  const absolute = resolve(path);
+  const homeAbs = resolve(home);
+  if (absolute === homeAbs) return "~";
+  if (absolute.startsWith(homeAbs + sep)) return `~/${absolute.slice(homeAbs.length + 1)}`;
+  return absolute;
+}
+
 /** Every file path in a record is relative to the video directory. */
 export function videoFile(library: LibraryPaths, videoId: string, relative: string): string {
   return join(videoDir(library, videoId), relative);
@@ -169,8 +213,49 @@ function absolutize(path: string, cwd: string): string {
   return isAbsolute(path) ? resolve(path) : resolve(cwd, path);
 }
 
-/** The 17-character YouTube id, as produced by every URL shape we accept. */
+/** The 11-character YouTube id, as produced by every URL shape we accept. */
 export const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+/**
+ * A local file's id: the `local-` prefix plus 12 hex characters of the file's
+ * SHA-256. The prefix keeps the namespace disjoint from YouTube ids, so no
+ * command can mistake one for the other.
+ */
+export const LOCAL_ID_PREFIX = "local-";
+export const LOCAL_ID_HEX = 12;
+export const LOCAL_ID_RE = /^local-[0-9a-f]{12}$/;
+
+/** Either id shape a record may carry. */
+export const ARCHIVE_ID_RE = /^(?:[A-Za-z0-9_-]{11}|local-[0-9a-f]{12})$/;
+
+export function isLocalId(value: string): boolean {
+  return LOCAL_ID_RE.test(value);
+}
+
+export function isArchiveId(value: string): boolean {
+  return ARCHIVE_ID_RE.test(value);
+}
+
+/** A record id from an id or any accepted YouTube URL, without touching the network. */
+export function archiveIdFromInput(input: string): string | null {
+  const trimmed = input.trim();
+  if (isArchiveId(trimmed)) return trimmed;
+  return parseVideoUrl(trimmed).id;
+}
+
+/** `local-9f2c4a71b3de` from the full SHA-256 of the file's bytes. */
+export function localIdForSha256(sha256: string): string {
+  const digest = sha256.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(digest)) {
+    throw new Error(`not a sha256 digest: ${sha256}`);
+  }
+  return `${LOCAL_ID_PREFIX}${digest.slice(0, LOCAL_ID_HEX)}`;
+}
+
+/** The URL a local record stores as its origin: a hash, never a filesystem path. */
+export function localOriginUrl(sha256: string): string {
+  return `local:sha256:${sha256.trim().toLowerCase()}`;
+}
 
 export type UrlKind = "video" | "playlist" | "channel" | "shorts" | "unknown";
 

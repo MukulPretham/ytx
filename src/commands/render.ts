@@ -3,12 +3,24 @@
  * Kept apart from the commands so the provenance header has exactly one owner.
  */
 
+import { usageError } from "../core/errors.ts";
 import { PROVENANCE_LABELS, PROVENANCE_MARKERS, type Meta, type Provenance, type TranscriptSegment } from "../core/schema.ts";
 import { formatDuration } from "../core/ui.ts";
 import { formatTimestamp } from "../captions/vtt.ts";
 
 export const TRANSCRIPT_FORMATS = ["txt", "json", "srt", "vtt", "md"] as const;
 export type TranscriptFormat = (typeof TRANSCRIPT_FORMATS)[number];
+
+/** Validate a requested format, naming every choice when it is unknown. */
+export function parseTranscriptFormat(value: string | undefined): TranscriptFormat {
+  if (value === undefined) return "txt";
+  if ((TRANSCRIPT_FORMATS as readonly string[]).includes(value)) return value as TranscriptFormat;
+  throw usageError(
+    `--format ${value}`,
+    "is not a transcript format",
+    `use one of ${TRANSCRIPT_FORMATS.join(", ")}`,
+  );
+}
 
 /**
  * One renderer for every command that prints a transcript, so `show`, `transcript`
@@ -103,6 +115,24 @@ export function chapterLines(meta: Meta, limit = 8): string[] {
   );
   if (meta.chapters.length > limit) lines.push(`  … ${meta.chapters.length - limit} more`);
   return lines;
+}
+
+/**
+ * The readable name shared by the per-video export folder and its files. The id
+ * in parentheses keeps two records with the same title from colliding.
+ */
+export function exportBaseName(title: string, id: string): string {
+  const safe = title
+    .replace(/[/\\:*?"<>|\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^\.+/, "");
+  const clipped = safe.length > 100 ? safe.slice(0, 100).trimEnd() : safe;
+  return clipped === "" ? id : `${clipped} (${id})`;
+}
+
+export function exportFileName(title: string, id: string, ext: string): string {
+  return `${exportBaseName(title, id)}.${ext}`;
 }
 
 export function formatClock(seconds: number): string {

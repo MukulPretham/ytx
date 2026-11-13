@@ -9,12 +9,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { noTranscriptError, qualityError, usageError, YtxError } from "../core/errors.ts";
+import { fetchError, noTranscriptError, qualityError, usageError, YtxError } from "../core/errors.ts";
 import { detectLanguage, type LanguageGuess } from "../captions/lang.ts";
 import { describeFailures, evaluateGates, repetitionVerdict, type GateMetrics } from "../captions/gates.ts";
 import { duplicateLineRatioOf, normalizeTrack, segmentCues, type NormalizedTrack } from "../captions/normalize.ts";
 import { catalogChoices } from "../models/catalog.ts";
-import { configuredModel } from "../models/manager.ts";
+import { configuredModel, resolveModelPath } from "../models/manager.ts";
+import { findUv } from "../asr/venv.ts";
+import { requireFfmpeg } from "./context.ts";
 import { planLadder, type Availability, type LadderPlan } from "../captions/ladder.ts";
 import { parseCaptions, toVtt, type ParsedCaptions } from "../captions/vtt.ts";
 import type { TranscriptSegment } from "../core/schema.ts";
@@ -84,6 +86,23 @@ export function assertAsrConfigured(context: CommandContext): string {
   return name;
 }
 
+/**
+ * Fail with the model choices, not a copy or a download, when ASR cannot run.
+ * `ytx import` calls this before it reads a single byte of the source file.
+ */
+export async function requireAsrReady(context: CommandContext): Promise<void> {
+  const name = assertAsrConfigured(context);
+  resolveModelPath(context.runtime, name);
+  requireFfmpeg(context);
+  if (findUv(context.runtime) === null) {
+    throw fetchError(
+      "transcription environment",
+      "uv is not installed, so the mlx-whisper venv cannot be created",
+      "run `ytx setup` to install it",
+    );
+  }
+}
+
 export function acquisitionOptions(
   context: CommandContext,
   overrides: Partial<AcquisitionOptions> = {},
@@ -110,7 +129,8 @@ export async function acquireTranscript(
     url: string;
     durationS: number;
     availability: Availability;
-    ytdlpVersion: string;
+    /** The downloader version, or null for a local import (no downloader ran). */
+    ytdlpVersion: string | null;
     /** Directory holding the media, for ASR. Created when needed. */
     videoDir: string;
     /** Audio file for ASR, downloaded lazily by this function. */

@@ -49,6 +49,11 @@ export const ConfigSchema = z.object({
   parallel: z.number().int().positive(),
   /** Browser to pull cookies from for bot-check resilience; "" means none. */
   browser: z.string(),
+  /**
+   * Where `ytx format` writes exports. "" means "ask on first use"; a relative
+   * path resolves against the library root, so a portable library can keep one.
+   */
+  export_dir: z.string().default(""),
   /** yt-dlp release channel that `ytx update` follows. */
   ytdlp_channel: z.enum(["stable", "nightly"]),
   /** Reference videos `ytx update` canaries a new binary against. */
@@ -66,6 +71,7 @@ export function defaultConfig(): Config {
     asr_model: "none",
     parallel: 1,
     browser: "",
+    export_dir: "",
     ytdlp: "auto",
     ytdlp_channel: "stable",
     canary_urls: [...DEFAULT_CANARY_URLS],

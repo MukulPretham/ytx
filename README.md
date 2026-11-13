@@ -1,7 +1,8 @@
 # ytx
 
-Archive a YouTube video, an audio copy of it, and its full transcript into a
-self-contained local library you can read, search, and quote later.
+Archive a YouTube video or a local media file, an audio copy of it, and its full
+transcript into a self-contained local library you can read, search, and quote
+later.
 
 ```
 $ ytx add https://www.youtube.com/watch?v=jNQXAC9IVRw
@@ -28,6 +29,11 @@ What lands on disk:
 Every transcript records where it came from: human-written captions (`H`),
 the platform's own speech recognition (`A`, legacy records only in this build),
 and a local Whisper model (`M`). The three values are never collapsed into two.
+
+A local file gets `videos/local-<12 hex>/`, where the twelve characters are the
+start of the file's SHA-256. The prefix keeps local ids disjoint from YouTube
+ids, and the hash makes re-importing the same bytes a no-op rather than a second
+copy.
 
 ```
 $ ytx list
@@ -87,6 +93,10 @@ If a command reaches a point where it needs local transcription and no model is
 configured, it prints the catalog with sizes and exits `2` instead of
 downloading anything implicitly.
 
+The wizard also asks where `ytx format` should write. Scripted installs answer it
+with `ytx setup --export-dir <path>`; leaving it out keeps the question for the
+first interactive `ytx format`, which saves the answer to `export_dir`.
+
 ## Usage
 
 ### Archive a video
@@ -122,6 +132,45 @@ ytx add https://www.youtube.com/watch?v=jNQXAC9IVRw --transcript-only
 ytx add https://www.youtube.com/watch?v=jNQXAC9IVRw --asr
 ```
 
+### Archive a local file
+
+```
+ytx import <path> [<path>...] [options]
+```
+
+`import` is the local counterpart to `add`. It never calls yt-dlp and never
+queues a retry: the file is already on disk, so a failure is fixed by hand.
+A local file has no caption tracks, so the transcript always comes from local
+speech recognition.
+
+```
+$ ytx import ~/Movies/talk.mp4
+importing talk.mp4 · 42m 10s · 1920x1080 · 1.4 GB
+  tier 4 · transcribing locally
+✓ local-9f2c4a71b3de transcript archived (asr, 612 segments)
+✓ media archived: local-9f2c4a71b3de.mp4 (1080p) · local-9f2c4a71b3de.m4a · local-9f2c4a71b3de.mp3
+```
+
+The source file is copied, byte for byte, into the record; it is never
+transcoded. The audio track is extracted beside it (copied when its codec has a
+matching container, otherwise converted to AAC), and the mp3 is generated from
+that. An audio-only input skips extraction: its own bytes are the audio track.
+
+| flag | meaning |
+| --- | --- |
+| `--language auto` | transcription language; `auto` lets Whisper detect it |
+| `--title <text>` | override the title (one file at a time) |
+| `--allow-repetitive` | silence the repetition warning |
+| `--force` | re-import the same bytes, keeping the old transcript in history |
+| `--transcript-only` | transcript only; `--no-media` is the same thing |
+| `--parallel 2` | concurrent imports |
+
+Importing needs `ffmpeg`, `ffprobe` and a configured model, and does not need
+`yt-dlp` at all. Re-importing the same bytes from another directory reports
+`already archived as local-…` instead of copying them again. `--transcript-only`
+leaves the record with no media files, and a later `--force --transcript-only`
+never deletes media the record already has.
+
 ### Read and search
 
 ```
@@ -156,11 +205,44 @@ H dQw4w9WgXcQ title       Rick Astley - Never Gonna Give You Up (Official Video)
 H dQw4w9WgXcQ transcript 00:40  ♪ Gotta make you understand ♪ ♪ Never gonna give you up ♪ …
 ```
 
+### Export transcripts
+
+```
+ytx format <id> [type]          # type: txt | md | srt | vtt | json, or "all"
+ytx format local-ab81e4966c95 md
+ytx format local-ab81e4966c95 all
+ytx format local-ab81e4966c95 srt --dir ./subs
+ytx format local-ab81e4966c95 txt --timestamps
+```
+
+The export folder comes from `export_dir` in `config.toml`. If the key is
+empty, the first interactive `ytx format` asks for a folder (suggesting
+`~/Desktop/ytx-transcripts`), creates it, saves the answer, and continues. A
+non-interactive run exits `2` instead of guessing, so scripts never write to a
+folder nobody chose. `ytx setup` asks the same question, and
+`ytx setup --export-dir <path>` answers it without a prompt.
+
+| value | destination |
+| --- | --- |
+| `""` | not set yet: the first interactive `format` asks |
+| `~/Desktop/ytx-transcripts` | the suggested default |
+| `~/Exports` | your home directory |
+| `exports` (relative) | `<library>/exports` |
+| `/Volumes/Archive/txt` | exactly as written |
+
+Each record gets its own folder, `<title> (<id>)`, inside the export folder, and
+the requested formats are written there as `<title> (<id>).<ext>`. Two records
+with the same title therefore never mix. Markdown exports start with the title
+as a heading; `--timestamps` prefixes each paragraph with its start time in txt
+and md.
+`--dir <path>` overrides the configured folder for one run, and
+`ytx format <id> all` writes every format at once.
+
 ### Local transcription
 
-`ytx add --asr` runs `mlx-whisper` in a `uv`-managed venv inside the runtime
-directory. The audio is extracted to 16 kHz mono PCM first, and the model is
-always passed as an explicit local directory, so a machine with weights
+`ytx add --asr` and `ytx import` run `mlx-whisper` in a `uv`-managed venv inside
+the runtime directory. The audio is extracted to 16 kHz mono PCM first, and the
+model is always passed as an explicit local directory, so a machine with weights
 installed needs no network.
 
 ### Models

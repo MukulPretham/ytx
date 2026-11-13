@@ -5,8 +5,17 @@
  */
 
 import { z } from "zod";
+import { ARCHIVE_ID_RE, LOCAL_ID_RE, VIDEO_ID_RE, localIdForSha256, localOriginUrl } from "./paths.ts";
 
-export const RECORD_SCHEMA = 1;
+export const RECORD_SCHEMA = 2;
+
+/**
+ * Where a record's bytes came from. It decides which commands may touch the
+ * record: `youtube` records are re-fetched through yt-dlp, `file` records are
+ * only ever re-imported by hand.
+ */
+export const ORIGINS = ["youtube", "file"] as const;
+export type Origin = (typeof ORIGINS)[number];
 
 export const PROVENANCES = ["caption-human", "caption-auto", "asr"] as const;
 export type Provenance = (typeof PROVENANCES)[number];
@@ -51,6 +60,24 @@ export const MediaSchema = z.object({
   mp3: relativeFile.nullable(),
   height: z.number().int().positive().nullable(),
 });
+
+/**
+ * The source of an imported file. The filename is a basename on purpose: the
+ * library never learns where the file lived, so it stays relocatable.
+ */
+export const SourceFileSchema = z.object({
+  kind: z.literal("file"),
+  filename: z
+    .string()
+    .min(1)
+    .refine((name) => !name.includes("/") && !name.includes("\\") && name !== "." && name !== "..", {
+      message: "must be a bare filename",
+    }),
+  bytes: z.number().int().nonnegative(),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/, "not a sha256 digest"),
+});
+
+export type SourceFile = z.infer<typeof SourceFileSchema>;
 
 export const TranscriptRecordSchema = z
   .object({
@@ -120,28 +147,96 @@ export const TranscriptHistoryEntrySchema = TranscriptRecordSchema.and(
   z.object({ superseded_at: z.string().min(1) }),
 );
 
-export const MetaSchema = z.object({
-  schema: z.number().int(),
-  id: z.string().regex(/^[A-Za-z0-9_-]{11}$/, "not a YouTube video id"),
-  url: z.string().min(1),
-  title: z.string(),
-  channel: ChannelSchema,
-  duration_s: z.number().nonnegative(),
-  published: z.string().nullable(),
-  chapters: z.array(ChapterSchema),
-  media: MediaSchema,
-  transcript: TranscriptRecordSchema,
-  transcript_history: z.array(TranscriptHistoryEntrySchema),
-  /**
-   * Non-fatal observations about this acquisition, e.g. "human captions repeat
-   * a chorus line 41% of the time; repetition is not a rejection for human
-   * captions". Warnings never block a record; they are the record's own note
-   * about why something that looks odd was accepted.
-   */
-  warnings: z.array(z.string()).default([]),
-  added_at: z.string().min(1),
-  updated_at: z.string().min(1),
-});
+export const MetaSchema = z
+  .object({
+    schema: z.union([z.literal(1), z.literal(2)]),
+    /** Absent in v1 records, which are all YouTube videos. */
+    origin: z.enum(ORIGINS).default("youtube"),
+    id: z.string().regex(ARCHIVE_ID_RE, "not a YouTube video id or a local id"),
+    url: z.string().min(1),
+    /** Present only for `origin: "file"`. */
+    source: SourceFileSchema.optional(),
+    title: z.string(),
+    channel: ChannelSchema,
+    duration_s: z.number().nonnegative(),
+    published: z.string().nullable(),
+    chapters: z.array(ChapterSchema),
+    media: MediaSchema,
+    transcript: TranscriptRecordSchema,
+    transcript_history: z.array(TranscriptHistoryEntrySchema),
+    /**
+     * Non-fatal observations about this acquisition, e.g. "human captions repeat
+     * a chorus line 41% of the time; repetition is not a rejection for human
+     * captions". Warnings never block a record; they are the record's own note
+     * about why something that looks odd was accepted.
+     */
+    warnings: z.array(z.string()).default([]),
+    added_at: z.string().min(1),
+    updated_at: z.string().min(1),
+  })
+  .superRefine((value, ctx) => {
+    if (value.origin === "file") {
+      if (value.schema !== 2) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["schema"],
+          message: 'must be 2 for origin "file"',
+        });
+      }
+      if (!LOCAL_ID_RE.test(value.id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["id"],
+          message: 'must be "local-" followed by 12 hex characters for origin "file"',
+        });
+      }
+      if (!value.source) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["source"],
+          message: 'required for origin "file"',
+        });
+        return;
+      }
+      if (value.url !== localOriginUrl(value.source.sha256)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["url"],
+          message: "must be local:sha256:<source.sha256>",
+        });
+      }
+      if (value.id !== localIdForSha256(value.source.sha256)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["id"],
+          message: "must be derived from source.sha256",
+        });
+      }
+      return;
+    }
+
+    if (!VIDEO_ID_RE.test(value.id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["id"],
+        message: "not an 11-character YouTube video id",
+      });
+    }
+    if (value.source) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["source"],
+        message: 'file-only field, not valid for origin "youtube"',
+      });
+    }
+    if (!/^https?:\/\//.test(value.url)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["url"],
+        message: 'must be an http(s) URL for origin "youtube"',
+      });
+    }
+  });
 
 export type Meta = z.infer<typeof MetaSchema>;
 export type Media = z.infer<typeof MediaSchema>;

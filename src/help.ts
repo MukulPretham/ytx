@@ -3,7 +3,7 @@
  * `ytx <command> --help` explains that command's flags and exit codes.
  */
 
-export const HELP = `ytx — archive YouTube videos with their transcripts
+export const HELP = `ytx — archive YouTube videos or local media with their transcripts
 
 usage: ytx <command> [options]
 
@@ -12,7 +12,9 @@ commands
   setup        install dependencies and run the first-run wizard
   update       refresh yt-dlp (canaried), or roll back
   doctor       check dependencies, records, models and provenance
-  add          archive one or more videos
+  add          archive one or more YouTube videos
+  import       archive one or more local media files
+  format       export a transcript to the export folder
   transcript   re-acquire a transcript for an archived video
   show         print a transcript with its provenance header
   list         list archived videos (H human / A legacy machine / M local)
@@ -50,13 +52,14 @@ Idempotent; existing files are left alone.
 `,
   setup: `ytx setup [options]
 
-Bootstrap this machine. With a terminal it runs the wizard (library, language,
-model, browser, confirm); otherwise it takes the defaults. Every step is
+Bootstrap this machine. With a terminal it runs the wizard (library, formats,
+language, model, browser, confirm); otherwise it takes the defaults. Every step is
 idempotent and resumable.
 
   --language <code>     preferred caption language (or "auto")
   --with-model <name>   catalog name or owner/repo; omit it to install no weights
   --browser <name>      cookies source for bot-check resilience, or "skip"
+  --export-dir <path>   where \`ytx format\` writes; omit it to be asked
   --force               reinstall components that already exist
 
 The default model is "none": setup never downloads weights unless you ask with
@@ -87,10 +90,31 @@ Broken records are named individually instead of aborting the scan.
   --fix    repair safe, non-destructive problems (missing directories,
            regenerable transcript.txt files, stale locks, empty directories)
 `,
+  import: `ytx import <path> [<path>...] [options]
+
+Archive a local media file: video, audio, mp3 and a transcript from local
+speech recognition. No yt-dlp call is made, and nothing is queued for retry.
+
+The file is identified by the SHA-256 of its bytes, so importing the same bytes
+twice reports "already archived" instead of copying them again.
+
+  --language <code>            transcription language (or "auto" to detect)
+  --title <text>               override the title (single file only)
+  --allow-repetitive           silence the repetition warning
+  --force                      re-import the same file, keeping history
+  --transcript-only            transcript only (alias: --no-media)
+  --no-media                   transcript only; preferred spelling
+  --parallel <n>               concurrent imports
+
+Importing needs ffmpeg, ffprobe and a configured transcription model; it does
+not need yt-dlp.
+`,
   add: `ytx add <url> [<url>...] [options]
 
 Archive video, audio and transcript. The transcript is acquired first so
 \`list\` and \`search\` are useful immediately; media downloads afterwards.
+
+For a file already on disk, use \`ytx import <path>\`.
 
   --max-height <n>             video height ceiling (default 1080)
   --language <code>            preferred caption language (or "auto")
@@ -104,6 +128,23 @@ Archive video, audio and transcript. The transcript is acquired first so
   --force                      re-archive an existing video
   --no-media                   transcript only (alias: --transcript-only)
   --transcript-only            transcript only; preferred spelling
+`,
+  format: `ytx format <id|url> [type] [options]
+
+Write an archived transcript into the export folder. The folder is \`export_dir\`
+in config.toml. If it is empty, an interactive run asks once (suggesting
+~/Desktop/ytx-transcripts), saves the answer, and continues; a non-interactive
+run exits 2 instead of guessing. A relative value is resolved against the
+library root.
+
+  type           txt | md | srt | vtt | json, or "all" (default: txt)
+  --timestamps   prefix txt/md paragraphs with their start time
+  --dir <path>   write here instead of the configured folder
+
+Each record gets its own folder, "<title> (<id>)", inside the export folder; all
+requested formats are written there as "<title> (<id>).<ext>". Two records with
+the same title therefore never mix. Markdown exports start with the title as a
+heading. Existing files with the same name are replaced.
 `,
   transcript: `ytx transcript <id|url> [options]
 

@@ -14,8 +14,8 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import { defaultConfig, saveConfig } from "../core/config.ts";
-import { EXIT, asYtxError, fetchError, usageError, YtxError } from "../core/errors.ts";
-import { canonicalWatchUrl, parseVideoUrl, videoDir } from "../core/paths.ts";
+import { EXIT, asYtxError, usageError, YtxError } from "../core/errors.ts";
+import { canonicalWatchUrl, isArchiveId, parseVideoUrl, videoDir } from "../core/paths.ts";
 import {
   META_FILE,
   TRANSCRIPT_JSON,
@@ -50,7 +50,7 @@ import {
   snippet,
   type TranscriptFormat,
 } from "./render.ts";
-import { acquireTranscript, acquisitionOptions } from "./acquisition.ts";
+import { acquireTranscript, acquisitionOptions, requireAsrReady } from "./acquisition.ts";
 import type { CommandContext } from "./context.ts";
 import { ensureLibrary, failAfterEmit, requireDownloader, requireFfmpeg } from "./context.ts";
 import {
@@ -61,9 +61,6 @@ import {
   type YtdlpRawInfo,
 } from "../ytdlp/run.ts";
 import { acquireLock } from "../core/lock.ts";
-import { catalogChoices } from "../models/catalog.ts";
-import { configuredModel, resolveModelPath } from "../models/manager.ts";
-import { findUv } from "../asr/venv.ts";
 
 /** Acquisition flags shared by `add`, `transcript` and `retry`. */
 export interface QuestionFlags {
@@ -157,27 +154,6 @@ async function preflightAdd(context: CommandContext, flags: AddFlags): Promise<v
   if (flags.asr) await requireAsrReady(context);
 }
 
-/** Fail with the model choices, not a download, when ASR cannot run. */
-async function requireAsrReady(context: CommandContext): Promise<void> {
-  const name = configuredModel(context.state.default_model, context.config.asr_model);
-  if (name === "none") {
-    throw usageError(
-      "transcription",
-      'no local model is configured (asr_model = "none")',
-      `choose one with \`ytx models add <name>\` (${catalogChoices()}), then \`ytx models default <name>\``,
-    );
-  }
-  resolveModelPath(context.runtime, name);
-  requireFfmpeg(context);
-  if (findUv(context.runtime) === null) {
-    throw fetchError(
-      "transcription environment",
-      "uv is not installed, so the mlx-whisper venv cannot be created",
-      "run `ytx setup` to install it",
-    );
-  }
-}
-
 export async function cmdAdd(
   context: CommandContext,
   positionals: string[],
@@ -204,7 +180,7 @@ export async function cmdAdd(
       throw usageError(
         `add ${input}`,
         "is not a YouTube video URL",
-        "use a `youtube.com/watch?v=…`, `youtu.be/…` or `youtube.com/shorts/…` URL",
+        "use a `youtube.com/watch?v=…`, `youtu.be/…` or `youtube.com/shorts/…` URL; for a local file use `ytx import <path>`",
       );
     }
     return { url: canonicalWatchUrl(parsed.id), id: parsed.id };
@@ -352,6 +328,7 @@ async function addOne(
 
     const meta: Meta = {
       schema: 1,
+      origin: "youtube",
       id: videoId,
       url,
       title: typeof raw.title === "string" ? raw.title : videoId,
@@ -491,7 +468,7 @@ export async function cmdTranscript(
     );
   }
 
-  const looksLikeUrl = !/^[A-Za-z0-9_-]{11}$/.test(input.trim());
+  const looksLikeUrl = !isArchiveId(input.trim());
   if (looksLikeUrl) {
     return previewTranscript(context, input, flags);
   }
@@ -976,6 +953,19 @@ export async function cmdPrune(
   }
 
   if (existsSync(context.library.videos)) {
+    // Imports stage under dot directories inside `videos/` so the publish is a
+    // rename on the same filesystem. A crashed run leaves one behind; it is
+    // invisible to `list`, and this is where it gets swept.
+    for (const entry of readdirSync(context.library.videos, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (!entry.name.startsWith(".incoming-") && !entry.name.startsWith(".trash-")) continue;
+      const dir = join(context.library.videos, entry.name);
+      targets.push({
+        path: dir,
+        reason: "interrupted import (staged files)",
+        bytes: dirSize(dir),
+      });
+    }
     for (const id of listVideoIds(context.library)) {
       const dir = videoDir(context.library, id);
       if (existsSync(join(dir, META_FILE))) continue;
@@ -1036,25 +1026,19 @@ export async function cmdSync(_context: CommandContext, positionals: string[]): 
   });
 }
 
-export function parseTranscriptFormat(value: string | undefined): TranscriptFormat {
-  if (value === undefined) return "txt";
-  if ((TRANSCRIPT_FORMATS as readonly string[]).includes(value)) return value as TranscriptFormat;
-  throw usageError(
-    `--format ${value}`,
-    "is not a transcript format",
-    `use one of ${TRANSCRIPT_FORMATS.join(", ")}`,
-  );
-}
-
 function requireTarget(positionals: string[], command: string): string {
   const input = positionals[0];
   if (!input) {
     throw usageError(command, "needs a video id or URL", "run `ytx list` to see archived videos");
   }
+  if (isArchiveId(input.trim())) return input.trim();
   const parsed = parseVideoUrl(input);
   if (parsed.id === null) {
-    if (/^[A-Za-z0-9_-]{11}$/.test(input)) return input;
-    throw usageError(`${command} ${input}`, "is not a video id or URL", "pass an 11-character id or a YouTube URL");
+    throw usageError(
+      `${command} ${input}`,
+      "is not a video id or URL",
+      "pass a YouTube URL, or an archived id (11 characters, or `local-` followed by 12 hex characters)",
+    );
   }
   return parsed.id;
 }

@@ -99,7 +99,15 @@ export function readMeta(library: LibraryPaths, videoId: string): Meta {
 
 /** Write a record only after validation; a rejected record touches nothing. */
 export function writeMeta(library: LibraryPaths, meta: Meta): void {
-  writeJsonValidated(metaPath(library, meta.id), MetaSchema, meta, "meta.json");
+  writeMetaFile(videoDir(library, meta.id), meta);
+}
+
+/**
+ * Same contract as `writeMeta`, into an explicit directory. Staged imports and
+ * a finished video directory validate identically.
+ */
+export function writeMetaFile(directory: string, meta: Meta): void {
+  writeJsonValidated(join(directory, META_FILE), MetaSchema, meta, "meta.json");
 }
 
 export function readTranscript(library: LibraryPaths, videoId: string): TranscriptSegment[] {
@@ -145,6 +153,15 @@ export function writeTranscript(
   videoId: string,
   segments: TranscriptSegment[],
 ): void {
+  writeTranscriptFiles(videoDir(library, videoId), videoId, segments);
+}
+
+/** The validation and rendering behind `writeTranscript`, for a staged directory. */
+export function writeTranscriptFiles(
+  directory: string,
+  videoId: string,
+  segments: TranscriptSegment[],
+): void {
   const parsed = TranscriptSchema.safeParse(segments);
   if (!parsed.success) {
     throw integrityError(
@@ -153,8 +170,8 @@ export function writeTranscript(
       "report this as a bug in ytx",
     );
   }
-  writeJsonValidated(transcriptJsonPath(library, videoId), TranscriptSchema, parsed.data, "transcript.json");
-  writeFileSync(transcriptTxtPath(library, videoId), renderTranscriptText(parsed.data), "utf8");
+  writeJsonValidated(join(directory, TRANSCRIPT_JSON), TranscriptSchema, parsed.data, "transcript.json");
+  writeFileSync(join(directory, TRANSCRIPT_TXT), renderTranscriptText(parsed.data), "utf8");
 }
 
 /** The plain-text rendering: paragraph blocks separated by a blank line. */

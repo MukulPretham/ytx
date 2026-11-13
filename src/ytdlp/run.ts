@@ -527,8 +527,9 @@ export async function makeMp3(ffmpeg: string, input: string, out: string): Promi
 }
 
 export async function probeHeight(ffmpeg: string, file: string): Promise<number | null> {
-  const ffprobe = join(ffmpeg, "..", "ffprobe");
-  if (!existsSync(ffprobe)) return null;
+  const sibling = join(ffmpeg, "..", "ffprobe");
+  const ffprobe = existsSync(sibling) ? sibling : Bun.which("ffprobe");
+  if (ffprobe === null) return null;
   const result = await run(
     ffprobe,
     ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", file],
@@ -548,7 +549,7 @@ export async function captureVersion(binary: string): Promise<string | null> {
 export function findExistingAudio(directory: string, videoId: string): string | null {
   try {
     const names = readdirSync(directory)
-      .filter((name) => name.startsWith(`${videoId}.`) && /\.(m4a|mp3|opus|webm|aac|ogg)$/i.test(name))
+      .filter((name) => name.startsWith(`${videoId}.`) && /\.(m4a|mp3|opus|webm|aac|ogg|flac|wav)$/i.test(name))
       .sort();
     const first = names[0];
     return first ? join(directory, first) : null;

@@ -34,6 +34,7 @@ function library(): { paths: LibraryPaths; root: string; cleanup: () => void } {
 function sample(overrides: Partial<Meta> = {}): Meta {
   return {
     schema: 1,
+    origin: "youtube",
     id: ID,
     url: `https://www.youtube.com/watch?v=${ID}`,
     title: "A test video",

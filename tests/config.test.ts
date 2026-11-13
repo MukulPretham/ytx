@@ -24,6 +24,7 @@ describe("defaultConfig", () => {
     expect(config.asr_model).toBe("none");
     expect(config.parallel).toBe(1);
     expect(config.browser).toBe("");
+    expect(config.export_dir).toBe("");
     expect(config.ytdlp).toBe("auto");
     expect(config.ytdlp_channel).toBe("stable");
     expect(config.canary_urls.length).toBeGreaterThanOrEqual(2);
@@ -41,9 +42,40 @@ describe("loadConfig", () => {
   test("reads a written config back unchanged", () => {
     const lib = library();
     const { paths } = resolveLibraryPaths({ env: {}, cwd: lib.root, home: lib.root, store: lib.root });
-    const config = { ...defaultConfig(), language: "hi", max_height: 720, browser: "chrome" };
+    const config = {
+      ...defaultConfig(),
+      language: "hi",
+      max_height: 720,
+      browser: "chrome",
+      export_dir: "~/Exports",
+    };
     saveConfig(paths, config);
     expect(loadConfig(paths)).toEqual(config);
+    lib.cleanup();
+  });
+
+  test("a config written before export_dir existed still loads", () => {
+    const lib = library();
+    const { paths } = resolveLibraryPaths({ env: {}, cwd: lib.root, home: lib.root, store: lib.root });
+    const legacy = defaultConfig() as Record<string, unknown>;
+    delete legacy.export_dir;
+    writeFileSync(
+      paths.config,
+      [
+        "schema = 1",
+        'language = "en"',
+        "max_height = 1080",
+        'quality = "auto"',
+        'asr_model = "none"',
+        'ytdlp = "auto"',
+        "parallel = 1",
+        'browser = ""',
+        'ytdlp_channel = "stable"',
+        'canary_urls = [ "https://www.youtube.com/watch?v=jNQXAC9IVRw" ]',
+        "",
+      ].join("\n"),
+    );
+    expect(loadConfig(paths).export_dir).toBe("");
     lib.cleanup();
   });
 

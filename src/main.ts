@@ -21,10 +21,12 @@ import {
   cmdShow,
   cmdSync,
   cmdTranscript,
-  parseTranscriptFormat,
   provenanceFilter,
   type AddFlags,
 } from "./commands/library.ts";
+import { cmdImport, type ImportFlags } from "./commands/import.ts";
+import { cmdFormat } from "./commands/format.ts";
+import { parseTranscriptFormat } from "./commands/render.ts";
 import { cmdModels } from "./commands/models.ts";
 import { cmdDoctor, cmdSetup, cmdUpdate } from "./commands/system.ts";
 import { VERSION } from "./version.ts";
@@ -52,6 +54,7 @@ const COMMAND_OPTIONS: Record<string, Record<string, { type: "boolean" | "string
     model: { type: "string" },
     "with-model": { type: "string" },
     browser: { type: "string" },
+    "export-dir": { type: "string" },
     force: { type: "boolean" },
   },
   update: {
@@ -79,6 +82,20 @@ const COMMAND_OPTIONS: Record<string, Record<string, { type: "boolean" | "string
     force: { type: "boolean" },
     "no-media": { type: "boolean" },
     "transcript-only": { type: "boolean" },
+  },
+  import: {
+    language: { type: "string" },
+    lang: { type: "string" },
+    title: { type: "string" },
+    "allow-repetitive": { type: "boolean" },
+    parallel: { type: "string" },
+    force: { type: "boolean" },
+    "no-media": { type: "boolean" },
+    "transcript-only": { type: "boolean" },
+  },
+  format: {
+    timestamps: { type: "boolean" },
+    dir: { type: "string" },
   },
   transcript: {
     language: { type: "string" },
@@ -217,6 +234,7 @@ async function dispatch(
           withModel: stringFlag(values, "with-model"),
           model: stringFlag(values, "model"),
           browser: stringFlag(values, "browser"),
+          exportDir: stringFlag(values, "export-dir"),
           force: values.force === true,
         },
         global,
@@ -254,6 +272,24 @@ async function dispatch(
       }
       return cmdAdd(context, positionals, flags);
     }
+
+    case "import": {
+      const flags: ImportFlags = {
+        language: languageFlag(values, context.config.language),
+        allowRepetitive: values["allow-repetitive"] === true,
+        force: values.force === true,
+        transcriptOnly: values["transcript-only"] === true || values["no-media"] === true,
+        title: stringFlag(values, "title") ?? null,
+        parallel: numberFlag(values, "parallel", context.config.parallel),
+      };
+      return cmdImport(context, positionals, flags);
+    }
+
+    case "format":
+      return cmdFormat(context, positionals, {
+        timestamps: values.timestamps === true,
+        dir: stringFlag(values, "dir") ?? null,
+      });
 
     case "transcript":
       return cmdTranscript(context, positionals, {

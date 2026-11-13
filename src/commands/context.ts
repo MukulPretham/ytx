@@ -4,6 +4,7 @@
  */
 
 import { existsSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { defaultConfig, loadConfig, saveConfig, type Config } from "../core/config.ts";
 import { SilentExit, fetchError, type YtxError } from "../core/errors.ts";
 import { resolvePaths, type LibraryPaths, type Paths, type RuntimePaths } from "../core/paths.ts";
@@ -31,6 +32,8 @@ export interface CommandContext {
   downloader: DownloaderOptions;
   /** ffmpeg to use: the PATH one, else the runtime copy, else "ffmpeg". */
   ffmpeg: string;
+  /** ffprobe paired with ffmpeg; `import` cannot run without it. */
+  ffprobe: string;
   /** uv if one is available, else null. */
   uv: string | null;
   reload: () => void;
@@ -59,6 +62,7 @@ export function buildContext(flags: GlobalFlags, env = process.env, cwd = proces
       onLine: flags.debug ? (line) => ui.note(line) : undefined,
     },
     ffmpeg: resolveFfmpegPath(paths.runtime),
+    ffprobe: resolveFfprobePath(paths.runtime),
     uv: findUv(paths.runtime),
     reload: () => {
       context.state = loadState(paths.runtime.state);
@@ -71,6 +75,7 @@ export function buildContext(flags: GlobalFlags, env = process.env, cwd = proces
         available: next.available,
       };
       context.ffmpeg = resolveFfmpegPath(paths.runtime);
+      context.ffprobe = resolveFfprobePath(paths.runtime);
       context.uv = findUv(paths.runtime);
     },
   };
@@ -83,12 +88,36 @@ export function resolveFfmpegPath(runtime: RuntimePaths): string {
   return Bun.which("ffmpeg") ?? runtime.ffmpeg;
 }
 
+/**
+ * ffprobe is normally installed beside ffmpeg: Homebrew puts both in the same
+ * bin directory, and the static build downloads both into `runtime/bin`. A
+ * PATH ffprobe is the fallback when a static ffmpeg was installed without it.
+ */
+export function resolveFfprobePath(runtime: RuntimePaths): string {
+  const sibling = join(dirname(resolveFfmpegPath(runtime)), "ffprobe");
+  if (existsSync(sibling)) return sibling;
+  return Bun.which("ffprobe") ?? runtime.ffprobe;
+}
+
 export function requireFfmpeg(context: CommandContext): string {
   const path = context.ffmpeg;
   if (!existsSync(path) && Bun.which("ffmpeg") === null) {
     throw fetchError(
       "ffmpeg",
       "is not installed, and it is required to mux media and transcribe audio",
+      "run `ytx setup` to install a static build",
+    );
+  }
+  return path;
+}
+
+/** Import needs ffprobe for duration, streams, chapters and title. */
+export function requireFfprobe(context: CommandContext): string {
+  const path = context.ffprobe;
+  if (!existsSync(path) && Bun.which("ffprobe") === null) {
+    throw fetchError(
+      "ffprobe",
+      "is not installed, and importing a local file needs it to read the container",
       "run `ytx setup` to install a static build",
     );
   }

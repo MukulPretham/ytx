@@ -1,7 +1,7 @@
 /**
  * The first-run wizard.
  *
- * Five questions, in a fixed order, each with a default so plain Enter is a
+ * Six questions, in a fixed order, each with a default so plain Enter is a
  * valid path. Nothing is installed while asking: the summary is the last chance
  * to change your mind, and Ctrl-C at any point exits 130 leaving whatever was
  * already installed intact.
@@ -9,7 +9,10 @@
 
 import { intro, isCancel, log, note, outro, select, text } from "@clack/prompts";
 import { rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { YtxError } from "./core/errors.ts";
+import { defaultExportDir, toConfigPath } from "./core/paths.ts";
+import { askExportDir } from "./prompts.ts";
 import { CATALOG, parseRepoInput } from "./models/catalog.ts";
 import { fetchRepoInfo, notACheckpointError } from "./models/hub.ts";
 import { formatBytes } from "./core/ui.ts";
@@ -17,6 +20,8 @@ import type { CommandContext } from "./commands/context.ts";
 
 export interface WizardChoices {
   library: string;
+  /** Where `ytx format` writes; "" means the first format asks. */
+  exportDir: string;
   language: string;
   /** "none", a catalog name, or an explicit `owner/repo`. */
   model: string;
@@ -49,6 +54,7 @@ export interface WizardOverrides {
   language?: string;
   model?: string;
   browser?: string;
+  exportDir?: string;
 }
 
 export function wizardDefaults(
@@ -57,6 +63,7 @@ export function wizardDefaults(
 ): WizardChoices {
   return {
     library: context.library.root,
+    exportDir: overrides.exportDir ?? context.config.export_dir,
     language: overrides.language || context.config.language || "en",
     // A3: no model unless the user asks for one. Plain Enter must not pull
     // 1.5 GB of weights.
@@ -93,7 +100,18 @@ export async function runWizard(input: {
   );
   choices.library = library.trim();
 
-  // 2. Preferred language
+  // 2. Export folder. The suggested value is created and saved only when the
+  // answer is accepted; a library configured by an older build starts empty and
+  // lets `ytx format` ask instead, so setup does not force a choice here.
+  const suggestedExport =
+    defaults.exportDir !== ""
+      ? defaults.exportDir
+      : toConfigPath(defaultExportDir(homedir()), homedir());
+  const exported = await askExportDir(suggestedExport);
+  if (exported === null) cancelSetup(context);
+  choices.exportDir = exported;
+
+  // 3. Preferred language
   const language = cancelGuard(
     await select({
       message: "Preferred caption language?",
@@ -123,7 +141,7 @@ export async function runWizard(input: {
     choices.language = String(language);
   }
 
-  // 3. Transcription model
+  // 4. Transcription model
   const modelChoice = cancelGuard(
     await select({
       message: "Which transcription model?",
@@ -147,7 +165,7 @@ export async function runWizard(input: {
     choices.model = String(modelChoice);
   }
 
-  // 4. Browser for cookies
+  // 5. Browser for cookies
   const browser = cancelGuard(
     await select({
       message: "Read cookies from a signed-in browser? (helps with bot checks)",
@@ -158,7 +176,7 @@ export async function runWizard(input: {
   );
   choices.browser = String(browser);
 
-  // 5. Summary + confirm
+  // 6. Summary + confirm
   const modelEntry = CATALOG.find((entry) => entry.name === choices.model);
   const customSize = modelEntry ? 0 : await customRepoSize(choices.model);
   const modelBytes = modelEntry ? modelEntry.size_mb * 1_000_000 : customSize;
@@ -169,6 +187,7 @@ export async function runWizard(input: {
   note(
     [
       `library      ${choices.library}`,
+      `formats      ${choices.exportDir === "" ? "not set (the first ytx format asks)" : choices.exportDir}`,
       `language     ${choices.language === "auto" ? "auto-detect (each video's original)" : choices.language}`,
       `model        ${choices.model}${modelEntry ? `  ${formatMb(modelEntry.size_mb)}` : ""}`,
       `browser      ${choices.browser === "skip" ? "skipped" : choices.browser}`,
@@ -254,18 +273,20 @@ async function customRepoSize(repo: string): Promise<number> {
   }
 }
 
+function cancelSetup(context: CommandContext): never {
+  // Ctrl-C: drop scratch space, keep anything already installed.
+  rmSync(context.runtime.tmp, { recursive: true, force: true });
+  throw new YtxError({
+    what: "setup",
+    why: "interrupted with Ctrl-C",
+    next: "completed components were kept; rerun `ytx setup` to resume",
+    code: 130,
+    kind: "cancelled",
+  });
+}
+
 function cancelGuard<T>(value: T | symbol, context: CommandContext): T {
-  if (isCancel(value)) {
-    // Ctrl-C: drop scratch space, keep anything already installed.
-    rmSync(context.runtime.tmp, { recursive: true, force: true });
-    throw new YtxError({
-      what: "setup",
-      why: "interrupted with Ctrl-C",
-      next: "completed components were kept; rerun `ytx setup` to resume",
-      code: 130,
-      kind: "cancelled",
-    });
-  }
+  if (isCancel(value)) cancelSetup(context);
   return value as T;
 }
 

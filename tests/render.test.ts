@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderTranscript, TRANSCRIPT_FORMATS } from "../src/commands/render.ts";
-import { parseTranscriptFormat } from "../src/commands/library.ts";
+import { parseTranscriptFormat } from "../src/commands/render.ts";
 import type { TranscriptSegment } from "../src/core/schema.ts";
 
 const SEGMENTS: TranscriptSegment[] = [
